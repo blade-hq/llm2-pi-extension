@@ -83,11 +83,11 @@ async function readJSON(response: Response): Promise<Record<string, unknown>> {
 
 type CatalogResult = { models: ModelConfig[]; headers?: Record<string, string> };
 
-async function fetchCatalog(signal: AbortSignal, key: string): Promise<CatalogResult> {
+async function fetchCatalog(signal: AbortSignal | undefined, key: string): Promise<CatalogResult> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), CATALOG_TIMEOUT_MS);
 	const onAbort = () => controller.abort();
-	signal.addEventListener("abort", onAbort, { once: true });
+	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		const response = await fetch(catalogURL(baseURL()), {
 			signal: controller.signal,
@@ -106,7 +106,7 @@ async function fetchCatalog(signal: AbortSignal, key: string): Promise<CatalogRe
 		return { models, headers };
 	} finally {
 		clearTimeout(timer);
-		signal.removeEventListener("abort", onAbort);
+		signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -328,7 +328,8 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 					},
 					async resolve({ ctx, credential, signal }) {
 						const key = credential?.key?.trim() || (await ctx.env("LLM2_API_KEY"))?.trim();
-						signal.throwIfAborted();
+						// Pi 0.83 /model refresh resolves the API key without a signal.
+						signal?.throwIfAborted();
 						return key ? { auth: { apiKey: key, headers: { Authorization: `Bearer ${key}` } }, source: credential?.key ? "stored credential" : "LLM2_API_KEY" } : undefined;
 					},
 				},

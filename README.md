@@ -15,8 +15,8 @@ The Portal backend stays private. This repository contains only the code that ru
 Install a fixed Git tag:
 
 ```bash
-pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.2
-omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.2
+pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.3
+omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.3
 ```
 
 The same source works with both clients. The package manifest declares both `pi.extensions` and `omp.extensions`.

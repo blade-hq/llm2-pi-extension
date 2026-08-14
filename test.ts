@@ -56,6 +56,19 @@ describe("llm2 provider authentication", () => {
 		expect(requests.at(-1)?.authorization).toBe("Bearer stored-pi-key");
 	});
 
+	test("Pi API-key resolve works when refresh omits signal", async () => {
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const provider = harness.registered as {
+			auth: { apiKey: { resolve(input: { ctx: { env(name: string): Promise<string | undefined> }; credential: { type: "api_key"; key: string } }): Promise<{ auth: { apiKey: string } } | undefined> } };
+		};
+		const resolved = await provider.auth.apiKey.resolve({
+			ctx: { env: async () => undefined },
+			credential: { type: "api_key", key: "stored-pi-key" },
+		});
+		expect(resolved?.auth.apiKey).toBe("stored-pi-key");
+	});
+
 	test("OMP startup publishes models when an environment key is available", async () => {
 		const previous = process.env.LLM2_API_KEY;
 		process.env.LLM2_API_KEY = "stored-omp-key";
