@@ -284,72 +284,21 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 		},
 	} as any;
 
-	if (isOMP) {
-		let initialModels: ModelConfig[] | undefined;
-		if (apiKey) {
-			try {
-				initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
-			} catch {
-				// OMP's dynamic catalog cache remains available when the Portal cannot
-				// be reached during startup.
-			}
-		}
-		if (initialModels) {
+	// Use the config-form provider on both clients. createProvider() from a
+	// locally installed pi-ai can disagree with the host Pi about the refresh
+	// context (store vs publish) and abort the /model catalog update.
+	if (isOMP && apiKey) {
+		try {
+			const initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
 			// Seed OMP's synchronous model list so --model can resolve during startup.
 			// Register the dynamic provider immediately afterwards; keeping that
 			// registration model-free preserves refresh and credential rotation.
 			pi.registerProvider(providerID, { ...providerConfig, models: initialModels });
+		} catch {
+			// OMP's dynamic catalog cache remains available when the Portal cannot
+			// be reached during startup.
 		}
-		pi.registerProvider(providerID, providerConfig);
-	} else {
-		const [{ createProvider }, { getApiProvider }] = await Promise.all([
-			import("@earendil-works/pi-ai"),
-			import("@earendil-works/pi-ai/compat"),
-		]);
-		let models: ModelConfig[] = [];
-		const piStreams = getApiProvider("openai-completions");
-		if (!piStreams) throw new Error("Pi 没有注册 openai-completions API");
-		pi.registerProvider(createProvider({
-			id: providerID,
-			name: providerName,
-			baseUrl: baseURL(),
-			headers: { "X-App-Name": env("LLM2_APP_NAME", "pi-llm2") },
-			auth: {
-				apiKey: {
-					name: "BladeAI Portal API Key",
-					async login(interaction) {
-						const key = (await interaction.prompt({
-							type: "secret",
-							message: "粘贴你的 BladeAI Portal API Key",
-							placeholder: "sk-llm2-...",
-						})).trim();
-						if (!key) throw new Error("API Key 不能为空");
-						return { type: "api_key" as const, key };
-					},
-					async resolve({ ctx, credential, signal }) {
-						const key = credential?.key?.trim() || (await ctx.env("LLM2_API_KEY"))?.trim();
-						// Pi 0.83 /model refresh resolves the API key without a signal.
-						signal?.throwIfAborted();
-						return key ? { auth: { apiKey: key, headers: { Authorization: `Bearer ${key}` } }, source: credential?.key ? "stored credential" : "LLM2_API_KEY" } : undefined;
-					},
-				},
-			},
-			models,
-			async fetchModels(context) {
-				if (!context.allowNetwork) return models;
-				const key = portalKey(context.credential);
-				if (!key) throw new Error("没有 Portal API Key，请运行 /login llm2 或设置 LLM2_API_KEY");
-				models = (await fetchCatalog(context.signal, key)).models;
-				return models.map(model => ({
-					...model,
-					provider: providerID,
-					baseUrl: model.baseUrl ?? baseURL(),
-					api: model.api ?? "openai-completions",
-				})) as any;
-			},
-			api: piStreams,
-		}));
-
 	}
+	pi.registerProvider(providerID, providerConfig);
 	registerTools(pi);
 }
