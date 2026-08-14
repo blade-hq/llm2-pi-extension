@@ -22,14 +22,18 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 const { default: extension } = await import("./index.ts");
 
 function piHarness() {
-	let registered: unknown;
+	const registrations: unknown[] = [];
 	const pi = {
 		registerProvider(provider: unknown, config?: unknown) {
-			registered = config === undefined ? provider : { provider, config };
+			registrations.push(config === undefined ? provider : { provider, config });
 		},
 		registerTool() {},
 	};
-	return { pi, get registered() { return registered; } };
+	return {
+		pi,
+		registrations,
+		get registered() { return registrations.at(-1); },
+	};
 }
 
 describe("llm2 provider authentication", () => {
@@ -52,12 +56,34 @@ describe("llm2 provider authentication", () => {
 		expect(requests.at(-1)?.authorization).toBe("Bearer stored-pi-key");
 	});
 
-	test("OMP dynamic discovery uses the resolved login key", async () => {
+	test("OMP startup publishes models when an environment key is available", async () => {
+		const previous = process.env.LLM2_API_KEY;
+		process.env.LLM2_API_KEY = "stored-omp-key";
+		try {
+			const harness = piHarness();
+			(harness.pi as Record<string, unknown>).pi = {};
+			await extension(harness.pi as never);
+			const registrations = harness.registrations as Array<{
+				provider: string;
+				config: { models?: Array<{ id: string }>; fetchDynamicModels?(key?: string): Promise<Array<{ id: string }>> };
+			}>;
+			expect(registrations).toHaveLength(2);
+			expect(registrations[0]?.config.models?.map(model => model.id)).toEqual(["test-model"]);
+			expect(registrations[1]?.provider).toBe("llm2");
+			expect(registrations[1]?.config.models).toBeUndefined();
+			expect(registrations[1]?.config.fetchDynamicModels).toBeFunction();
+			expect(requests.at(-1)?.authorization).toBe("Bearer stored-omp-key");
+		} finally {
+			if (previous === undefined) delete process.env.LLM2_API_KEY;
+			else process.env.LLM2_API_KEY = previous;
+		}
+	});
+
+	test("OMP dynamic discovery uses the resolved login key without an environment key", async () => {
 		const harness = piHarness();
 		(harness.pi as Record<string, unknown>).pi = {};
 		await extension(harness.pi as never);
 		const registration = harness.registered as { provider: string; config: { fetchDynamicModels(key?: string): Promise<Array<{ id: string }>> } };
-		expect(registration.provider).toBe("llm2");
 		const models = await registration.config.fetchDynamicModels("stored-omp-key");
 		expect(models.map(model => model.id)).toEqual(["test-model"]);
 		expect(requests.at(-1)?.authorization).toBe("Bearer stored-omp-key");
