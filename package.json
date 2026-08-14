@@ -1,6 +1,6 @@
 {
   "name": "@blade-hq/llm2-pi-extension",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "BladeAI LLM2 provider, search, image generation, and model discovery for pi and Oh My Pi",
   "keywords": ["pi-package", "omp-plugin"],
   "license": "UNLICENSED",

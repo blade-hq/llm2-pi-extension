@@ -5,6 +5,7 @@ const DEFAULT_BASE_URL = "https://llm2.yangl.com.cn/v1";
 const DEFAULT_PROVIDER_ID = "llm2";
 const DEFAULT_PROVIDER_NAME = "BladeAI LLM2";
 const CATALOG_TIMEOUT_MS = 30_000;
+const OMP_STARTUP_CATALOG_TIMEOUT_MS = 3_000;
 
 type ModelConfig = {
 	id: string;
@@ -284,6 +285,21 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	} as any;
 
 	if (isOMP) {
+		let initialModels: ModelConfig[] | undefined;
+		if (apiKey) {
+			try {
+				initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
+			} catch {
+				// OMP's dynamic catalog cache remains available when the Portal cannot
+				// be reached during startup.
+			}
+		}
+		if (initialModels) {
+			// Seed OMP's synchronous model list so --model can resolve during startup.
+			// Register the dynamic provider immediately afterwards; keeping that
+			// registration model-free preserves refresh and credential rotation.
+			pi.registerProvider(providerID, { ...providerConfig, models: initialModels });
+		}
 		pi.registerProvider(providerID, providerConfig);
 	} else {
 		const [{ createProvider }, { getApiProvider }] = await Promise.all([
@@ -323,7 +339,12 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 				const key = portalKey(context.credential);
 				if (!key) throw new Error("没有 Portal API Key，请运行 /login llm2 或设置 LLM2_API_KEY");
 				models = (await fetchCatalog(context.signal, key)).models;
-				return models.map(model => ({ ...model, provider: providerID, baseUrl: model.baseUrl ?? baseURL(), api: model.api ?? "openai-completions" })) as any;
+				return models.map(model => ({
+					...model,
+					provider: providerID,
+					baseUrl: model.baseUrl ?? baseURL(),
+					api: model.api ?? "openai-completions",
+				})) as any;
 			},
 			api: piStreams,
 		}));
