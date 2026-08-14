@@ -15,8 +15,8 @@ The Portal backend stays private. This repository contains only the code that ru
 Install a fixed Git tag:
 
 ```bash
-pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.0
-omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.0
+pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.1
+omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.1
 ```
 
 The same source works with both clients. The package manifest declares both `pi.extensions` and `omp.extensions`.
@@ -36,6 +36,8 @@ Or install the extension and run this command inside Pi or Oh My Pi:
 ```
 
 The key is sent to the BladeAI Portal for model catalog access and model requests. It is not sent to the upstream catalog provider.
+
+Pi stores the key in `~/.pi/agent/auth.json`; Oh My Pi stores it in its credential database. Model refresh reads the credential through each client's supported auth path, so users do not need to export `LLM2_API_KEY` after `/login llm2`.
 
 ## Use
 
@@ -65,7 +67,7 @@ This extension has the same local process permissions as Pi or Oh My Pi. Read th
 ## Development
 
 ```bash
-bun --check index.ts
+bun test ./test.ts
 ```
 
 The extension uses the public provider and tool registration APIs. It does not read Pi or Oh My Pi private databases or configuration files.
