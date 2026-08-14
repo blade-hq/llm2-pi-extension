@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_BASE_URL = "https://llm2.yangl.com.cn/v1";
@@ -52,11 +52,13 @@ function numberValue(value: unknown, fallback: number): number {
 
 function toModel(value: Record<string, unknown>): ModelConfig {
 	const fallbackCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	const api = String(value.api ?? "openai-completions");
+	const base = baseURL();
 	return {
 		id: String(value.id ?? ""),
 		name: String(value.name ?? value.id ?? ""),
-		api: String(value.api ?? "openai-completions"),
-		baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : undefined,
+		api,
+		baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : base,
 		reasoning: Boolean(value.reasoning),
 		thinkingLevelMap: value.thinkingLevelMap as ModelConfig["thinkingLevelMap"],
 		input: (Array.isArray(value.input) ? value.input : ["text"]).filter(
@@ -232,7 +234,8 @@ function registerTools(pi: ExtensionAPI) {
 	});
 }
 
-export default function bladeAIExtension(pi: ExtensionAPI) {
+export default async function bladeAIExtension(pi: ExtensionAPI) {
+	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
@@ -280,6 +283,51 @@ export default function bladeAIExtension(pi: ExtensionAPI) {
 		},
 	} as any;
 
-	pi.registerProvider(providerID, providerConfig);
+	if (isOMP) {
+		pi.registerProvider(providerID, providerConfig);
+	} else {
+		const [{ createProvider }, { getApiProvider }] = await Promise.all([
+			import("@earendil-works/pi-ai"),
+			import("@earendil-works/pi-ai/compat"),
+		]);
+		let models: ModelConfig[] = [];
+		const piStreams = getApiProvider("openai-completions");
+		if (!piStreams) throw new Error("Pi 没有注册 openai-completions API");
+		pi.registerProvider(createProvider({
+			id: providerID,
+			name: providerName,
+			baseUrl: baseURL(),
+			headers: { "X-App-Name": env("LLM2_APP_NAME", "pi-llm2") },
+			auth: {
+				apiKey: {
+					name: "BladeAI Portal API Key",
+					async login(interaction) {
+						const key = (await interaction.prompt({
+							type: "secret",
+							message: "粘贴你的 BladeAI Portal API Key",
+							placeholder: "sk-llm2-...",
+						})).trim();
+						if (!key) throw new Error("API Key 不能为空");
+						return { type: "api_key" as const, key };
+					},
+					async resolve({ ctx, credential, signal }) {
+						const key = credential?.key?.trim() || (await ctx.env("LLM2_API_KEY"))?.trim();
+						signal.throwIfAborted();
+						return key ? { auth: { apiKey: key, headers: { Authorization: `Bearer ${key}` } }, source: credential?.key ? "stored credential" : "LLM2_API_KEY" } : undefined;
+					},
+				},
+			},
+			models,
+			async fetchModels(context) {
+				if (!context.allowNetwork) return models;
+				const key = portalKey(context.credential);
+				if (!key) throw new Error("没有 Portal API Key，请运行 /login llm2 或设置 LLM2_API_KEY");
+				models = (await fetchCatalog(context.signal, key)).models;
+				return models.map(model => ({ ...model, provider: providerID, baseUrl: model.baseUrl ?? baseURL(), api: model.api ?? "openai-completions" })) as any;
+			},
+			api: piStreams,
+		}));
+
+	}
 	registerTools(pi);
 }
