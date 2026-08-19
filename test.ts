@@ -1,4 +1,14 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// The extension clears stale provider blocks out of the real config files on
+// startup, so every test in this file must run against a throwaway HOME.
+const originalHome = process.env.HOME;
+const sandbox = mkdtempSync(join(tmpdir(), "llm2-ext-"));
+process.env.HOME = sandbox;
+for (const key of ["PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"]) delete process.env[key];
 
 const requests: Array<{ url: string; authorization: string | null }> = [];
 const originalFetch = globalThis.fetch;
@@ -99,4 +109,67 @@ describe("llm2 provider authentication", () => {
 	});
 });
 
-afterAll(() => { globalThis.fetch = originalFetch; });
+function writeConfig(client: ".omp" | ".pi", file: string, content: string): string {
+	const dir = join(sandbox, client, "agent");
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, file);
+	writeFileSync(path, content);
+	return path;
+}
+
+describe("stale provider config cleanup", () => {
+	beforeEach(() => { rmSync(join(sandbox, ".omp"), { recursive: true, force: true }); rmSync(join(sandbox, ".pi"), { recursive: true, force: true }); });
+
+	test("removes the llm2 block from models.yml and leaves other providers untouched", async () => {
+		const path = writeConfig(".omp", "models.yml", [
+			"providers:",
+			"  llm2:",
+			"    baseUrl: https://llm2.yangl.com.cn/v1",
+			"    models:",
+			"  gpu22:",
+			"    baseUrl: http://gpu22:30001/v1",
+			"    models:",
+			"      - id: qwen3.5-122b-int4",
+			"",
+		].join("\n"));
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe([
+			"providers:",
+			"  gpu22:",
+			"    baseUrl: http://gpu22:30001/v1",
+			"    models:",
+			"      - id: qwen3.5-122b-int4",
+			"",
+		].join("\n"));
+		expect(readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toContain("llm2:");
+	});
+
+	test("keeps providers a mapping when llm2 was the only entry", async () => {
+		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    baseUrl: https://llm2.yangl.com.cn/v1\n    models:\n");
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe("providers: {}\n");
+	});
+
+	test("removes the llm2 block from models.json", async () => {
+		const path = writeConfig(".pi", "models.json", JSON.stringify({
+			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },
+		}));
+		await extension(piHarness().pi as never);
+		expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual({ providers: { litellm: { baseUrl: "http://x/v1" } } });
+	});
+
+	test("leaves a file without an llm2 block byte-identical and writes no backup", async () => {
+		const content = "providers:\n  gpu22:\n    baseUrl: http://gpu22:30001/v1\n    models:\n      - id: qwen3.5-122b-int4\n";
+		const path = writeConfig(".omp", "models.yml", content);
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
+	});
+});
+
+afterAll(() => {
+	globalThis.fetch = originalFetch;
+	rmSync(sandbox, { recursive: true, force: true });
+	if (originalHome === undefined) delete process.env.HOME;
+	else process.env.HOME = originalHome;
+});

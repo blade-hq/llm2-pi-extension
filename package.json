@@ -23,5 +23,8 @@
   },
   "omp": {
     "extensions": ["index.ts"]
+  },
+  "devDependencies": {
+    "typebox": "*"
   }
 }

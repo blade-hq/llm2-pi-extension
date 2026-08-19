@@ -1,3 +1,6 @@
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -182,6 +185,112 @@ async function generateImage(
 	return url;
 }
 
+const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
+
+// Remove a top-level `providers.<id>` block while leaving the rest of the file
+// byte-identical. Returns null when there is nothing to remove, so the caller
+// never rewrites a file it does not need to touch.
+function purgeYAML(text: string, providerID: string): string | null {
+	const lines = text.split("\n");
+	const root = lines.findIndex(line => /^providers\s*:\s*$/.test(line));
+	if (root < 0) return null;
+
+	let start = -1;
+	let baseIndent: string | null = null;
+	for (let i = root + 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (!line.trim() || line.trim().startsWith("#")) continue;
+		const entry = /^(\s+)([^\s:]+)\s*:/.exec(line);
+		if (!entry) break;
+		if (baseIndent === null) baseIndent = entry[1];
+		if (entry[1] !== baseIndent) continue;
+		if (entry[2] === providerID) { start = i; break; }
+	}
+	if (start < 0 || baseIndent === null) return null;
+
+	let end = lines.length;
+	for (let i = start + 1; i < lines.length; i++) {
+		if (!lines[i].trim()) continue;
+		if ((/^\s*/.exec(lines[i]) as RegExpExecArray)[0].length <= baseIndent.length) { end = i; break; }
+	}
+
+	const kept = [...lines.slice(0, start), ...lines.slice(end)];
+	// A bare `providers:` with no children parses as null and fails the same
+	// schema check this cleanup exists to prevent.
+	const survivor = kept.slice(root + 1).some(line => line.startsWith(baseIndent) && /^\s+[^\s:]+\s*:/.test(line));
+	if (!survivor) kept[root] = "providers: {}";
+	const result = kept.join("\n");
+	// Dropping a trailing block also drops the file's final newline.
+	return text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result;
+}
+
+function purgeJSON(text: string, providerID: string): string | null {
+	let parsed: { providers?: Record<string, unknown> };
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (!parsed?.providers || !(providerID in parsed.providers)) return null;
+	delete parsed.providers[providerID];
+	return `${JSON.stringify(parsed, null, 2)}\n`;
+}
+
+function purgeConfigFile(file: string, providerID: string): boolean {
+	if (!existsSync(file)) return false;
+	let text: string;
+	try {
+		text = readFileSync(file, "utf-8");
+	} catch {
+		return false;
+	}
+	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
+	if (purged === null) return false;
+	try {
+		copyFileSync(file, `${file}${PURGE_BACKUP_SUFFIX}`);
+		writeFileSync(file, purged);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// The host does not expose its resolved config path to extensions, so mirror
+// the directory rules instead: PI_CONFIG_DIR renames the root, a profile moves
+// it under profiles/<name>/, and PI_CODING_AGENT_DIR overrides the agent dir
+// outright. Both clients are swept: a stale block only breaks the client that
+// reads it, and clearing both means one launch fixes pi and Oh My Pi alike.
+function configFiles(): string[] {
+	const files = new Set<string>();
+	const agentDirs: string[] = [];
+	const override = process.env.PI_CODING_AGENT_DIR?.trim();
+	if (override) agentDirs.push(override);
+
+	const profile = process.env.OMP_PROFILE?.trim() || process.env.PI_PROFILE?.trim();
+	// Bun caches os.homedir() at startup, so read $HOME first: it is what the
+	// host itself resolves to, and it keeps the cleanup testable.
+	const home = process.env.HOME?.trim() || homedir();
+	for (const name of new Set([process.env.PI_CONFIG_DIR?.trim() || "", ".omp", ".pi"])) {
+		if (!name) continue;
+		const root = join(home, name);
+		agentDirs.push(join(root, "agent"));
+		if (profile) agentDirs.push(join(root, "profiles", profile, "agent"));
+	}
+	for (const dir of agentDirs) {
+		files.add(join(dir, "models.yml"));
+		files.add(join(dir, "models.json"));
+	}
+	return [...files];
+}
+
+// A hand-written provider block shadows the one this extension registers, and a
+// half-written one (`models:` with no value) fails schema validation and takes
+// the whole config file down with it -- every other provider in the file stops
+// resolving. Clearing it on startup keeps registration the single source.
+function purgeLegacyProvider(providerID: string): string[] {
+	return configFiles().filter(file => purgeConfigFile(file, providerID));
+}
+
 function registerTools(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "blade_web_search",
@@ -239,6 +348,7 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
+	const purged = purgeLegacyProvider(providerID);
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
 	// as an environment-variable name while Pi accepts interpolation syntax.
 	// A literal resolved value works in both clients and remains in process memory.
@@ -301,4 +411,16 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	}
 	pi.registerProvider(providerID, providerConfig);
 	registerTools(pi);
+
+	if (purged.length > 0 && typeof (pi as { on?: unknown }).on === "function") {
+		(pi as unknown as { on(event: string, handler: (event: unknown, ctx: { ui?: { notify?(message: string, type?: string): void } }) => void): void }).on(
+			"session_start",
+			(_event, ctx) => {
+				ctx.ui?.notify?.(
+					`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider。原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
+					"warning",
+				);
+			},
+		);
+	}
 }
