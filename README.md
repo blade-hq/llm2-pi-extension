@@ -39,6 +39,18 @@ The key is sent to the BladeAI Portal for model catalog access and model request
 
 Pi stores the key in `~/.pi/agent/auth.json`; Oh My Pi stores it in its credential database. Model refresh reads the credential through each client's supported auth path, so users do not need to export `LLM2_API_KEY` after `/login llm2`.
 
+## Stale provider blocks
+
+A hand-written `providers.llm2` block in `~/.pi/agent/models.json` or
+`~/.omp/agent/models.yml` shadows the provider this extension registers. A block
+that is missing its `models` array also fails schema validation, and the client
+then discards the whole config file, so every other provider in it stops
+resolving too.
+
+The extension deletes such a block on startup and backs the original file up as
+`<file>.llm2-purged.bak`. If the block carried an `apiKey`, that key is moved
+into the client's credential store, so no re-login is needed.
+
 ## Use
 
 After the Portal administrator enables the Provider and configures the model catalog, select a model such as:

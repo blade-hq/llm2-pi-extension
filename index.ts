@@ -40,10 +40,20 @@ function baseURL(): string {
 	return env("LLM2_BASE_URL", DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
+// Oh My Pi calls fetchDynamicModels() without a credential and without a
+// context, so a key the host already has would otherwise be invisible to the
+// catalog refresh. Both clients hand the extension a context at session_start;
+// cache what it resolves there and fall back to it afterwards.
+let hostKey: string | undefined;
+// An api key read out of a provider block just before it was deleted.
+let rescuedKey: string | undefined;
+// Whether that key made it into the host's credential store.
+let rescueStored = false;
+
 function portalKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
-	return process.env.LLM2_API_KEY?.trim() || undefined;
+	return process.env.LLM2_API_KEY?.trim() || hostKey || rescuedKey;
 }
 
 function catalogURL(base: string): string {
@@ -113,7 +123,9 @@ async function fetchCatalog(signal: AbortSignal | undefined, key: string): Promi
 	}
 }
 
-async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
+// Only consults the host's credential store, so callers can tell a key the
+// host has already persisted from one this extension is carrying in memory.
+async function keyFromRegistry(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const registry = ctx.modelRegistry as {
 		getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
@@ -134,7 +146,11 @@ async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string 
 		const key = auth?.auth?.apiKey?.trim();
 		if (key) return key;
 	}
-	return portalKey();
+	return undefined;
+}
+
+async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
+	return (await keyFromRegistry(ctx)) ?? portalKey();
 }
 
 async function portalRequest(
@@ -190,7 +206,13 @@ const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
 // Remove a top-level `providers.<id>` block while leaving the rest of the file
 // byte-identical. Returns null when there is nothing to remove, so the caller
 // never rewrites a file it does not need to touch.
-function purgeYAML(text: string, providerID: string): string | null {
+type PurgeResult = { text: string; apiKey?: string };
+
+function yamlValue(line: string): string {
+	return line.slice(line.indexOf(":") + 1).trim().replace(/^["']|["']$/g, "");
+}
+
+function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	const lines = text.split("\n");
 	const root = lines.findIndex(line => /^providers\s*:\s*$/.test(line));
 	if (root < 0) return null;
@@ -214,6 +236,8 @@ function purgeYAML(text: string, providerID: string): string | null {
 		if ((/^\s*/.exec(lines[i]) as RegExpExecArray)[0].length <= baseIndent.length) { end = i; break; }
 	}
 
+	const removed = lines.slice(start, end);
+	const apiKey = removed.find(line => /^\s+apiKey\s*:/.test(line));
 	const kept = [...lines.slice(0, start), ...lines.slice(end)];
 	// A bare `providers:` with no children parses as null and fails the same
 	// schema check this cleanup exists to prevent.
@@ -221,19 +245,26 @@ function purgeYAML(text: string, providerID: string): string | null {
 	if (!survivor) kept[root] = "providers: {}";
 	const result = kept.join("\n");
 	// Dropping a trailing block also drops the file's final newline.
-	return text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result;
+	return {
+		text: text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result,
+		apiKey: apiKey ? yamlValue(apiKey) || undefined : undefined,
+	};
 }
 
-function purgeJSON(text: string, providerID: string): string | null {
-	let parsed: { providers?: Record<string, unknown> };
+function purgeJSON(text: string, providerID: string): PurgeResult | null {
+	let parsed: { providers?: Record<string, { apiKey?: unknown }> };
 	try {
 		parsed = JSON.parse(text);
 	} catch {
 		return null;
 	}
 	if (!parsed?.providers || !(providerID in parsed.providers)) return null;
+	const apiKey = parsed.providers[providerID]?.apiKey;
 	delete parsed.providers[providerID];
-	return `${JSON.stringify(parsed, null, 2)}\n`;
+	return {
+		text: `${JSON.stringify(parsed, null, 2)}\n`,
+		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
+	};
 }
 
 function purgeConfigFile(file: string, providerID: string): boolean {
@@ -248,11 +279,15 @@ function purgeConfigFile(file: string, providerID: string): boolean {
 	if (purged === null) return false;
 	try {
 		copyFileSync(file, `${file}${PURGE_BACKUP_SUFFIX}`);
-		writeFileSync(file, purged);
-		return true;
+		writeFileSync(file, purged.text);
 	} catch {
 		return false;
 	}
+	// The deleted block may have been the only place the key lived. Keep it so
+	// the session stays usable and the key can be moved into the credential
+	// store once a context is available.
+	if (purged.apiKey && !rescuedKey) rescuedKey = purged.apiKey;
+	return true;
 }
 
 // The host does not expose its resolved config path to extensions, so mirror
@@ -288,6 +323,8 @@ function configFiles(): string[] {
 // the whole config file down with it -- every other provider in the file stops
 // resolving. Clearing it on startup keeps registration the single source.
 function purgeLegacyProvider(providerID: string): string[] {
+	rescuedKey = undefined;
+	rescueStored = false;
 	return configFiles().filter(file => purgeConfigFile(file, providerID));
 }
 
@@ -344,15 +381,109 @@ function registerTools(pi: ExtensionAPI) {
 	});
 }
 
+type AuthStorageLike = {
+	peekApiKey?(providerID: string): Promise<string | undefined> | string | undefined;
+	set?(providerID: string, credential: { type: string; key: string }): Promise<void> | void;
+};
+
+// Oh My Pi exposes its credential store on the extension api itself, which is
+// reachable at load time -- early enough to seed the catalog before the host
+// resolves --model. Pi has no equivalent at load time and goes through
+// modelRegistry at session_start instead.
+async function ompAuthStorage(pi: unknown): Promise<AuthStorageLike | undefined> {
+	const ns = (pi as { pi?: { discoverAuthStorage?: () => Promise<AuthStorageLike> } }).pi;
+	if (typeof ns?.discoverAuthStorage !== "function") return undefined;
+	try {
+		return await ns.discoverAuthStorage();
+	} catch {
+		return undefined;
+	}
+}
+
+async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+	try {
+		const key = await storage?.peekApiKey?.(providerID);
+		return typeof key === "string" && key.trim() ? key.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function storeKey(storage: AuthStorageLike | undefined, providerID: string, key: string): Promise<boolean> {
+	if (typeof storage?.set !== "function") return false;
+	try {
+		await storage.set(providerID, { type: "api_key", key });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+type SessionContext = {
+	ui?: { notify?(message: string, type?: string): void };
+	modelRegistry?: unknown;
+};
+
+// Move a rescued key into the host's credential store so it survives the
+// deletion. This is the Pi path -- Oh My Pi stores the key at load time,
+// before the catalog fetch that needs it.
+async function persistRescuedKey(providerID: string, ctx: SessionContext): Promise<boolean> {
+	const key = rescuedKey;
+	const registry = ctx.modelRegistry as
+		| { login?: (provider: string, type: string, interaction: unknown) => Promise<unknown> }
+		| undefined;
+	if (!key || typeof registry?.login !== "function") return false;
+	// The provider registers an oauth-shaped flow, but ask for the api_key form
+	// too: which one a host offers depends on how it composed the provider.
+	for (const type of ["oauth", "api_key"]) {
+		try {
+			await registry.login(providerID, type, { prompt: async () => key, notify: () => {} });
+			hostKey = key;
+			return true;
+		} catch {
+			// Try the next credential type.
+		}
+	}
+	return false;
+}
+
+async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
+	const key = await keyFromRegistry(ctx).catch(() => undefined);
+	if (key) hostKey = key;
+	if (rescuedKey && !rescueStored && !key) rescueStored = await persistRescuedKey(providerID, ctx);
+
+	const notes: string[] = [];
+	if (purged.length > 0) {
+		notes.push(
+			`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider，原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
+		);
+	}
+	if (rescuedKey) {
+		notes.push(
+			rescueStored
+				? "其中的 API Key 已存入凭据库，无需重新登录。"
+				: `其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`,
+		);
+	}
+	if (notes.length > 0) ctx.ui?.notify?.(notes.join(""), "warning");
+}
+
 export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
 	const purged = purgeLegacyProvider(providerID);
+
+	// Read the host credential before building the provider config: on Oh My Pi
+	// this is the only chance to publish models early enough for --model to
+	// resolve, and it is where a rescued key has to land to survive the purge.
+	const storage = await ompAuthStorage(pi);
+	hostKey = await storedKey(storage, providerID);
+	if (rescuedKey && !hostKey) rescueStored = await storeKey(storage, providerID, rescuedKey);
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
 	// as an environment-variable name while Pi accepts interpolation syntax.
 	// A literal resolved value works in both clients and remains in process memory.
-	const apiKey = process.env.LLM2_API_KEY?.trim() || undefined;
+	const apiKey = portalKey();
 
 	const providerConfig = {
 		name: providerName,
@@ -394,33 +525,28 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 		},
 	} as any;
 
+	// Seed Oh My Pi's synchronous model list so --model resolves during startup;
+	// its dynamic discovery runs too late for that. Register exactly once:
+	// a second registration replaces the first, so re-registering without models
+	// would throw the catalog away and leave every llm2 model unresolvable.
+	let initialModels: ModelConfig[] | undefined;
+	if (isOMP && apiKey) {
+		try {
+			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
+		} catch {
+			// Portal unreachable at startup: the host's cached catalog still applies.
+		}
+	}
 	// Use the config-form provider on both clients. createProvider() from a
 	// locally installed pi-ai can disagree with the host Pi about the refresh
 	// context (store vs publish) and abort the /model catalog update.
-	if (isOMP && apiKey) {
-		try {
-			const initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
-			// Seed OMP's synchronous model list so --model can resolve during startup.
-			// Register the dynamic provider immediately afterwards; keeping that
-			// registration model-free preserves refresh and credential rotation.
-			pi.registerProvider(providerID, { ...providerConfig, models: initialModels });
-		} catch {
-			// OMP's dynamic catalog cache remains available when the Portal cannot
-			// be reached during startup.
-		}
-	}
-	pi.registerProvider(providerID, providerConfig);
+	pi.registerProvider(providerID, initialModels?.length ? { ...providerConfig, models: initialModels } : providerConfig);
 	registerTools(pi);
 
-	if (purged.length > 0 && typeof (pi as { on?: unknown }).on === "function") {
-		(pi as unknown as { on(event: string, handler: (event: unknown, ctx: { ui?: { notify?(message: string, type?: string): void } }) => void): void }).on(
-			"session_start",
-			(_event, ctx) => {
-				ctx.ui?.notify?.(
-					`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider。原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
-					"warning",
-				);
-			},
-		);
+	const host = pi as unknown as {
+		on?(event: string, handler: (event: unknown, ctx: SessionContext) => Promise<void>): void;
+	};
+	if (typeof host.on === "function") {
+		host.on("session_start", (_event, ctx) => onSessionStart(providerID, purged, ctx));
 	}
 }

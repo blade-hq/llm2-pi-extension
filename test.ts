@@ -33,15 +33,21 @@ const { default: extension } = await import("./index.ts");
 
 function piHarness() {
 	const registrations: unknown[] = [];
+	const handlers: Record<string, Array<(event: unknown, ctx: unknown) => Promise<void>>> = {};
 	const pi = {
 		registerProvider(provider: unknown, config?: unknown) {
 			registrations.push(config === undefined ? provider : { provider, config });
 		},
 		registerTool() {},
+		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
+			(handlers[event] ??= []).push(handler);
+		},
 	};
 	return {
 		pi,
 		registrations,
+		handlers,
+		sessionStart(ctx: unknown) { return Promise.all((handlers.session_start ?? []).map(h => h(null, ctx))); },
 		get registered() { return registrations.at(-1); },
 	};
 }
@@ -86,11 +92,12 @@ describe("llm2 provider authentication", () => {
 				provider: string;
 				config: { models?: Array<{ id: string }>; fetchDynamicModels?(key?: string): Promise<Array<{ id: string }>> };
 			}>;
-			expect(registrations).toHaveLength(2);
+			// Exactly one registration: a second one replaces the first, so
+			// re-registering without models would discard the seeded catalog.
+			expect(registrations).toHaveLength(1);
+			expect(registrations[0]?.provider).toBe("llm2");
 			expect(registrations[0]?.config.models?.map(model => model.id)).toEqual(["test-model"]);
-			expect(registrations[1]?.provider).toBe("llm2");
-			expect(registrations[1]?.config.models).toBeUndefined();
-			expect(registrations[1]?.config.fetchDynamicModels).toBeFunction();
+			expect(registrations[0]?.config.fetchDynamicModels).toBeFunction();
 			expect(requests.at(-1)?.authorization).toBe("Bearer stored-omp-key");
 		} finally {
 			if (previous === undefined) delete process.env.LLM2_API_KEY;
@@ -164,6 +171,68 @@ describe("stale provider config cleanup", () => {
 		await extension(piHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe(content);
 		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
+	});
+});
+
+describe("api key handling", () => {
+	beforeEach(() => { rmSync(join(sandbox, ".omp"), { recursive: true, force: true }); rmSync(join(sandbox, ".pi"), { recursive: true, force: true }); });
+
+	test("Oh My Pi seeds the catalog with a key from its credential store", async () => {
+		const harness = piHarness();
+		(harness.pi as Record<string, unknown>).pi = {
+			discoverAuthStorage: async () => ({ peekApiKey: () => "sk-stored-omp" }),
+		};
+		await extension(harness.pi as never);
+		const registration = harness.registered as { config: { models?: Array<{ id: string }> } };
+		expect(registration.config.models?.map(model => model.id)).toEqual(["test-model"]);
+		expect(requests.at(-1)?.authorization).toBe("Bearer sk-stored-omp");
+	});
+
+	test("Oh My Pi stores a key rescued from the deleted provider block", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-rescued-omp\n    models:\n");
+		const stored: Array<{ provider: string; key: string }> = [];
+		const harness = piHarness();
+		(harness.pi as Record<string, unknown>).pi = {
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => undefined,
+				set: (provider: string, credential: { key: string }) => { stored.push({ provider, key: credential.key }); },
+			}),
+		};
+		await extension(harness.pi as never);
+		expect(stored).toEqual([{ provider: "llm2", key: "sk-rescued-omp" }]);
+		expect(requests.at(-1)?.authorization).toBe("Bearer sk-rescued-omp");
+	});
+
+	test("Pi moves a rescued key into the credential store at session start", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
+		const logins: Array<{ provider: string; type: string; key: string }> = [];
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const notes: string[] = [];
+		await harness.sessionStart({
+			ui: { notify: (message: string) => notes.push(message) },
+			modelRegistry: {
+				async login(provider: string, type: string, interaction: { prompt(): Promise<string> }) {
+					logins.push({ provider, type, key: await interaction.prompt() });
+				},
+			},
+		});
+		expect(logins).toEqual([{ provider: "llm2", type: "oauth", key: "sk-rescued-pi" }]);
+		expect(notes.join("")).toContain("已存入凭据库");
+	});
+
+	test("a rescued key is not re-stored when the host already has one", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
+		const logins: unknown[] = [];
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		await harness.sessionStart({
+			modelRegistry: {
+				getApiKeyForProvider: async () => "sk-already-stored",
+				login: async (...args: unknown[]) => { logins.push(args); },
+			},
+		});
+		expect(logins).toEqual([]);
 	});
 });
 
