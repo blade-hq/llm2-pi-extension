@@ -116,8 +116,8 @@ describe("llm2 provider authentication", () => {
 	});
 });
 
-function writeConfig(client: ".omp" | ".pi", file: string, content: string): string {
-	const dir = join(sandbox, client, "agent");
+function writeConfig(client: ".omp" | ".pi", file: string, content: string, profile?: string): string {
+	const dir = profile ? join(sandbox, client, "profiles", profile, "agent") : join(sandbox, client, "agent");
 	mkdirSync(dir, { recursive: true });
 	const path = join(dir, file);
 	writeFileSync(path, content);
@@ -257,6 +257,60 @@ describe("api key handling", () => {
 			},
 		});
 		expect(logins).toEqual([{ key: "sk-pi-key" }]);
+	});
+
+	test("rescues from the active profile, not the unprofiled file", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-unprofiled\n    models:\n");
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-active-profile\n    models:\n", "work");
+		const stored: Array<{ key: string }> = [];
+		process.env.OMP_PROFILE = "work";
+		try {
+			const harness = piHarness();
+			(harness.pi as Record<string, unknown>).pi = {
+				discoverAuthStorage: async () => ({
+					peekApiKey: () => undefined,
+					set: (_provider: string, credential: { key: string }) => { stored.push({ key: credential.key }); },
+				}),
+			};
+			await extension(harness.pi as never);
+			expect(stored).toEqual([{ key: "sk-active-profile" }]);
+		} finally {
+			delete process.env.OMP_PROFILE;
+		}
+	});
+
+	test("resolves an environment-variable reference instead of storing it verbatim", async () => {
+		// OMP reads apiKey as the name of an environment variable.
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: LLM2_PORTAL_TOKEN\n    models:\n");
+		const stored: Array<{ key: string }> = [];
+		process.env.LLM2_PORTAL_TOKEN = "sk-from-env";
+		try {
+			const harness = piHarness();
+			(harness.pi as Record<string, unknown>).pi = {
+				discoverAuthStorage: async () => ({
+					peekApiKey: () => undefined,
+					set: (_provider: string, credential: { key: string }) => { stored.push({ key: credential.key }); },
+				}),
+			};
+			await extension(harness.pi as never);
+			expect(stored).toEqual([{ key: "sk-from-env" }]);
+		} finally {
+			delete process.env.LLM2_PORTAL_TOKEN;
+		}
+	});
+
+	test("skips migration when the reference resolves to nothing", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "$LLM2_MISSING_VAR", models: [] } } }));
+		const logins: unknown[] = [];
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const notes: string[] = [];
+		await harness.sessionStart({
+			ui: { notify: (message: string) => notes.push(message) },
+			modelRegistry: { login: async (...args: unknown[]) => { logins.push(args); } },
+		});
+		expect(logins).toEqual([]);
+		expect(notes.join("")).not.toContain("API Key");
 	});
 
 	test("a rescued key is not re-stored when the host already has one", async () => {

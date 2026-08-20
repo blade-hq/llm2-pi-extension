@@ -275,7 +275,7 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
-function purgeConfigFile(file: string, providerID: string, hostFile: string): boolean {
+function purgeConfigFile(file: string, providerID: string, activeFile: string): boolean {
 	if (!existsSync(file)) return false;
 	let text: string;
 	try {
@@ -293,49 +293,68 @@ function purgeConfigFile(file: string, providerID: string, hostFile: string): bo
 	}
 	// The deleted block may have been the only place the key lived. Keep it so
 	// the session stays usable and the key can be moved into the credential
-	// store once a context is available. Only the running client's own file
-	// qualifies: the other client's block can hold a different key, and storing
-	// that one here would leave this client authenticating as the wrong account.
-	if (purged.apiKey && !rescuedKey && file.endsWith(hostFile)) rescuedKey = purged.apiKey;
+	// store once a context is available.
+	if (purged.apiKey && file === activeFile) rescuedKey = resolveKeyReference(purged.apiKey);
 	return true;
 }
 
 // The host does not expose its resolved config path to extensions, so mirror
 // the directory rules instead: PI_CONFIG_DIR renames the root, a profile moves
 // it under profiles/<name>/, and PI_CODING_AGENT_DIR overrides the agent dir
-// outright. Both clients are swept: a stale block only breaks the client that
-// reads it, and clearing both means one launch fixes pi and Oh My Pi alike.
-function configFiles(): string[] {
-	const files = new Set<string>();
-	const agentDirs: string[] = [];
-	const override = process.env.PI_CODING_AGENT_DIR?.trim();
-	if (override) agentDirs.push(override);
-
-	const profile = process.env.OMP_PROFILE?.trim() || process.env.PI_PROFILE?.trim();
+// outright.
+//
+// `active` is the single file the running client actually reads; `sweep` also
+// covers the other client and the inactive profile/root variants. Deleting from
+// all of them is safe -- a stale block only ever breaks the client that reads
+// it -- but a credential may only be taken from `active`, because that is the
+// one whose key this client would otherwise have authenticated with.
+function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 	// Bun caches os.homedir() at startup, so read $HOME first: it is what the
 	// host itself resolves to, and it keeps the cleanup testable.
 	const home = process.env.HOME?.trim() || homedir();
-	for (const name of new Set([process.env.PI_CONFIG_DIR?.trim() || "", ".omp", ".pi"])) {
-		if (!name) continue;
-		const root = join(home, name);
-		agentDirs.push(join(root, "agent"));
-		if (profile) agentDirs.push(join(root, "profiles", profile, "agent"));
+	const profile = process.env.OMP_PROFILE?.trim() || process.env.PI_PROFILE?.trim();
+	const configDir = process.env.PI_CONFIG_DIR?.trim() || (isOMP ? ".omp" : ".pi");
+	const override = process.env.PI_CODING_AGENT_DIR?.trim();
+	const profileSegments = profile ? ["profiles", profile] : [];
+
+	const activeDir = override || join(home, configDir, ...profileSegments, "agent");
+	const active = join(activeDir, isOMP ? "models.yml" : "models.json");
+
+	const dirs = new Set<string>([activeDir]);
+	for (const name of new Set([configDir, ".omp", ".pi"])) {
+		dirs.add(join(home, name, "agent"));
+		if (profile) dirs.add(join(home, name, "profiles", profile, "agent"));
 	}
-	for (const dir of agentDirs) {
-		files.add(join(dir, "models.yml"));
-		files.add(join(dir, "models.json"));
+	const sweep = new Set<string>();
+	for (const dir of dirs) {
+		sweep.add(join(dir, "models.yml"));
+		sweep.add(join(dir, "models.json"));
 	}
-	return [...files];
+	return { active, sweep: [...sweep] };
+}
+
+// Oh My Pi reads `apiKey` as the name of an environment variable and Pi accepts
+// $NAME / ${NAME} interpolation, so the field is not necessarily a secret.
+// Storing the reference text verbatim would put an unusable value in the
+// credential store, which only surfaces on a later launch without that variable
+// set -- after the working block is already gone. Resolve references, and skip
+// the migration when one resolves to nothing.
+function resolveKeyReference(value: string): string | undefined {
+	const interpolated = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
+	if (interpolated) return process.env[interpolated[1]]?.trim() || undefined;
+	if (/^[A-Z][A-Z0-9_]*$/.test(value)) return process.env[value]?.trim() || undefined;
+	return value;
 }
 
 // A hand-written provider block shadows the one this extension registers, and a
 // half-written one (`models:` with no value) fails schema validation and takes
 // the whole config file down with it -- every other provider in the file stops
 // resolving. Clearing it on startup keeps registration the single source.
-function purgeLegacyProvider(providerID: string, hostFile: string): string[] {
+function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
 	rescuedKey = undefined;
 	rescueStored = false;
-	return configFiles().filter(file => purgeConfigFile(file, providerID, hostFile));
+	const { active, sweep } = configPaths(isOMP);
+	return sweep.filter(file => purgeConfigFile(file, providerID, active));
 }
 
 function registerTools(pi: ExtensionAPI) {
@@ -482,9 +501,7 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
-	// Oh My Pi reads models.yml, Pi reads models.json. Both are swept, but only
-	// the running client's own file may hand over a credential.
-	const purged = purgeLegacyProvider(providerID, isOMP ? "models.yml" : "models.json");
+	const purged = purgeLegacyProvider(providerID, isOMP);
 
 	// Read the host credential before building the provider config: on Oh My Pi
 	// this is the only chance to publish models early enough for --model to
