@@ -454,10 +454,15 @@ async function purgeConfigFile(
 			return false;
 		}
 	};
-	const key = purged.apiKey ? resolveKeyReference(purged.apiKey, isOMP) : undefined;
-	if (key && !(await settleKey(key, snapshotHolds))) {
-		keyBlocked = true;
-		return false;
+	if (purged.apiKey) {
+		// An unresolved reference counts as unsettled too: the variable may simply
+		// not be exported yet, and deleting the block would remove the reference
+		// the user expects to start working once it is.
+		const key = resolveKeyReference(purged.apiKey, isOMP);
+		if (!key || !(await settleKey(key, snapshotHolds))) {
+			keyBlocked = true;
+			return false;
+		}
 	}
 
 	// Write a sibling and rename it into place: a direct write that fails
@@ -785,7 +790,12 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 			// A store that cannot be read is not a store known to be empty.
 			const current = await readStoredKey(storage, providerID);
 			if (!current.read) return false;
-			if (current.key) return true;
+			if (current.key) {
+				// Hand it to the catalog fetch below: that is the only discovery
+				// early enough for --model to resolve in this invocation.
+				stored = current.key;
+				return true;
+			}
 		}
 		// Last look at the config before the credential store is changed: a block
 		// rewritten since would make this key obsolete, and storing it anyway

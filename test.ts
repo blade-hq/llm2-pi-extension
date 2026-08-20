@@ -480,6 +480,26 @@ describe("api key handling", () => {
 		}
 	});
 
+	test("seeds the catalog with a credential found on the second read", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-from-block\n    models:\n");
+		let concurrent: string | undefined;
+		const harness = ompHarness({
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => {
+					const value = concurrent;
+					concurrent = "sk-from-login";
+					return value;
+				},
+				set: () => {},
+			}),
+		});
+		await extension(harness.pi as never);
+		// The catalog must still be fetched, with the key that just appeared.
+		expect(requests.at(-1)?.authorization).toBe("Bearer sk-from-login");
+		const registration = harness.registered as { config: { models?: unknown[] } };
+		expect(registration.config.models).toHaveLength(1);
+	});
+
 	test("Oh My Pi does not overwrite a credential stored concurrently", async () => {
 		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-from-block\n    models:\n");
 		const sets: string[] = [];
@@ -618,13 +638,18 @@ describe("api key handling", () => {
 		}
 	});
 
-	test("skips migration when the reference resolves to nothing", async () => {
-		// Nothing usable to move, so the block stays put rather than losing it.
+	test("keeps the block when the key reference resolves to nothing", async () => {
+		// The variable may simply not be exported yet; deleting the block would
+		// remove the reference the user expects to start working once it is.
 		const content = JSON.stringify({ providers: { llm2: { apiKey: "$LLM2_MISSING_VAR", models: [] } } });
 		const path = writeConfig(".pi", "models.json", content);
-		await extension(piHarness().pi as never);
+		const harness = piHarness();
+		await extension(harness.pi as never);
 		expect(readAuth().llm2).toBeUndefined();
-		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		const notes: string[] = [];
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) } });
+		expect(notes.join("")).toContain("/login");
 	});
 
 	test("Pi ignores OMP_PROFILE when locating its own config", async () => {
