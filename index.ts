@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -213,7 +213,18 @@ function unquote(value: string): string {
 	return value.replace(/^["']|["']$/g, "");
 }
 
-type ConfigShape = { providers?: Record<string, { apiKey?: unknown } | null> };
+type Providers = Record<string, { apiKey?: unknown } | null>;
+type ConfigShape = { providers?: unknown };
+
+// A malformed file can hold anything under `providers` -- `providers: disabled`
+// parses to a string. Without this check the `in` test below throws and takes
+// the whole extension down, which is worse than the stale block it came for.
+function providersOf(parsed: ConfigShape | undefined): Providers | undefined {
+	const providers = parsed?.providers;
+	return providers && typeof providers === "object" && !Array.isArray(providers)
+		? (providers as Providers)
+		: undefined;
+}
 
 // Bun powers both clients and ships a YAML parser. Without one this extension
 // will not edit YAML at all: a hand-rolled parse cannot be trusted to leave a
@@ -290,16 +301,17 @@ function removeYAMLBlock(text: string, providerID: string): string | null {
 // the client cannot load.
 function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	const before = parseYAML(text);
-	if (!before?.providers || !(providerID in before.providers)) return null;
+	const providers = providersOf(before);
+	if (!providers || !(providerID in providers)) return null;
 
 	const edited = removeYAMLBlock(text, providerID);
 	if (edited === null) return null;
 
-	const expected = { ...before, providers: { ...before.providers } };
+	const expected = { ...before, providers: { ...providers } };
 	delete expected.providers[providerID];
 	if (JSON.stringify(parseYAML(edited)) !== JSON.stringify(expected)) return null;
 
-	const apiKey = before.providers[providerID]?.apiKey;
+	const apiKey = providers[providerID]?.apiKey;
 	return {
 		text: edited,
 		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
@@ -307,15 +319,16 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 }
 
 function purgeJSON(text: string, providerID: string): PurgeResult | null {
-	let parsed: { providers?: Record<string, { apiKey?: unknown }> };
+	let parsed: ConfigShape;
 	try {
 		parsed = JSON.parse(text);
 	} catch {
 		return null;
 	}
-	if (!parsed?.providers || !(providerID in parsed.providers)) return null;
-	const apiKey = parsed.providers[providerID]?.apiKey;
-	delete parsed.providers[providerID];
+	const providers = providersOf(parsed);
+	if (!providers || !(providerID in providers)) return null;
+	const apiKey = providers[providerID]?.apiKey;
+	delete providers[providerID];
 	return {
 		text: `${JSON.stringify(parsed, null, 2)}\n`,
 		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
@@ -332,10 +345,17 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	}
 	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
 	if (purged === null) return false;
+	// Write a sibling and rename it into place: a direct write that fails
+	// halfway -- a full disk right after the backup copy, most concretely --
+	// would leave the live config truncated, which is exactly the damage this
+	// cleanup exists to prevent. Rename within a directory is atomic.
+	const temp = `${file}.llm2-tmp`;
 	try {
 		copyFileSync(file, `${file}${PURGE_BACKUP_SUFFIX}`);
-		writeFileSync(file, purged.text);
+		writeFileSync(temp, purged.text);
+		renameSync(temp, file);
 	} catch {
+		rmSync(temp, { force: true });
 		return false;
 	}
 	// The deleted block may have been the only place the key lived. Keep it so
@@ -395,10 +415,16 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 function resolveKeyReference(value: string, isOMP: boolean): string | undefined {
 	const interpolated = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
 	if (interpolated) return process.env[interpolated[1]]?.trim() || undefined;
-	// The bare-name form is Oh My Pi's alone. In Pi the same spelling is a
+	// The bare-name form is Oh My Pi's alone -- in Pi the same spelling is a
 	// literal key, and treating it as a reference would discard a usable one.
-	if (isOMP && /^[A-Z][A-Z0-9_]*$/.test(value)) return process.env[value]?.trim() || undefined;
-	return value;
+	if (!isOMP) return value;
+	// Env names are case-sensitive, so do not restrict the spelling: look the
+	// value up as written. Failing that, decide by shape -- something that could
+	// be an env name is an unset reference and must not be stored, while a
+	// spelling no env name can have (`sk-…`, dots, slashes) is a literal key.
+	const resolved = process.env[value]?.trim();
+	if (resolved) return resolved;
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) ? undefined : value;
 }
 
 // A hand-written provider block shadows the one this extension registers, and a

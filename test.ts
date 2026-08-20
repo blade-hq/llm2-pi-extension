@@ -214,7 +214,22 @@ describe("stale provider config cleanup", () => {
 		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
 	});
 
-	test("removes the llm2 block from models.json", async () => {
+	test("declines a file whose providers value is not a mapping", async () => {
+		const content = "providers: disabled\n";
+		const path = writeConfig(".omp", "models.yml", content);
+		// Must not throw: a crash here would stop the provider registering at all.
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
+	test("declines a models.json whose providers value is not an object", async () => {
+		const content = JSON.stringify({ providers: "disabled" });
+		const path = writeConfig(".pi", "models.json", content);
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
+	test("removes the llm2 block from models.json", async () =>{
 		const path = writeConfig(".pi", "models.json", JSON.stringify({
 			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },
 		}));
@@ -397,6 +412,39 @@ describe("api key handling", () => {
 			},
 		});
 		expect(logins).toEqual([{ key: "ABC123" }]);
+	});
+
+	test("Oh My Pi resolves a lowercase environment-variable name", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: llm2_portal_token\n    models:\n");
+		const stored: Array<{ key: string }> = [];
+		process.env.llm2_portal_token = "sk-from-lowercase-env";
+		try {
+			const harness = piHarness();
+			(harness.pi as Record<string, unknown>).pi = {
+				discoverAuthStorage: async () => ({
+					peekApiKey: () => undefined,
+					set: (_p: string, credential: { key: string }) => { stored.push({ key: credential.key }); },
+				}),
+			};
+			await extension(harness.pi as never);
+			expect(stored).toEqual([{ key: "sk-from-lowercase-env" }]);
+		} finally {
+			delete process.env.llm2_portal_token;
+		}
+	});
+
+	test("Oh My Pi keeps a literal key that cannot be an environment-variable name", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-llm2-literal\n    models:\n");
+		const stored: Array<{ key: string }> = [];
+		const harness = piHarness();
+		(harness.pi as Record<string, unknown>).pi = {
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => undefined,
+				set: (_p: string, credential: { key: string }) => { stored.push({ key: credential.key }); },
+			}),
+		};
+		await extension(harness.pi as never);
+		expect(stored).toEqual([{ key: "sk-llm2-literal" }]);
 	});
 
 	test("a rescued key is not re-stored when the host already has one", async () => {
