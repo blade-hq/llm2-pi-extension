@@ -439,8 +439,10 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 	try {
 		// The edit was computed from a snapshot. If another process or a dotfile
 		// sync rewrote the file since, renaming over it would discard that edit
-		// silently, so re-read and bail out instead. Checking before the backup
-		// leaves nothing behind when it does not match.
+		// silently, so re-read and bail out instead. Checked once up front to
+		// avoid pointless work, then again immediately before the rename so the
+		// unguarded window is just those two statements. Closing it completely
+		// would need a lock, which is not worth its own failure modes here.
 		if (readFileSync(target, "utf-8") !== text) return false;
 		// These files hold API keys for every provider, and are commonly mode
 		// 0600. A fresh temp file would land on 0644 under the usual umask and
@@ -448,9 +450,15 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 		// carry the original mode over. chmod after the write: the `mode` option
 		// is masked by the umask, an explicit chmod is not.
 		const mode = statSync(target).mode & 0o777;
-		copyFileSync(target, `${target}${PURGE_BACKUP_SUFFIX}`);
 		writeFileSync(temp, purged.text);
 		chmodSync(temp, mode);
+		if (readFileSync(target, "utf-8") !== text) {
+			rmSync(temp, { force: true });
+			return false;
+		}
+		// Back up last, so a mismatch above never leaves a backup of a file that
+		// was not replaced.
+		copyFileSync(target, `${target}${PURGE_BACKUP_SUFFIX}`);
 		renameSync(temp, target);
 	} catch {
 		rmSync(temp, { force: true });
