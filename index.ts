@@ -350,11 +350,35 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
+// Numeric literals outside string values. Scanning the raw text would also pick
+// up digits inside strings -- a `"2026-08-20"` would look like the unpreservable
+// literal `08` -- so track string state while walking.
+function numericTokens(text: string): string[] {
+	const tokens: string[] = [];
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (escaped) { escaped = false; continue; }
+		if (ch === "\\") { escaped = inString; continue; }
+		if (ch === '"') { inString = !inString; continue; }
+		if (inString) continue;
+		if (ch !== "-" && (ch < "0" || ch > "9")) continue;
+		const token = /^-?\d[\d.]*(?:[eE][+-]?\d+)?/.exec(text.slice(i))?.[0];
+		if (!token) continue;
+		tokens.push(token);
+		i += token.length - 1;
+	}
+	return tokens;
+}
+
 function purgeJSON(text: string, providerID: string): PurgeResult | null {
-	// A round trip through Number would silently rewrite integers past 2^53 --
-	// 9007199254740993 comes back as ...992 -- in providers this cleanup never
-	// meant to touch. 16 digits is the shortest length that can exceed it.
-	if (/\d{16,}/.test(text)) return null;
+	// Re-serializing rewrites every number through Number, so any literal that
+	// does not survive that trip unchanged -- past IEEE-754 exactness, or in
+	// exponent/padded notation -- would come back altered in a provider this
+	// cleanup never meant to touch. String(Number(x)) is JS's shortest
+	// round-trip form, which is precisely what JSON.stringify emits.
+	if (numericTokens(text).some(token => String(Number(token)) !== token)) return null;
 	let parsed: ConfigShape;
 	try {
 		parsed = JSON.parse(text);

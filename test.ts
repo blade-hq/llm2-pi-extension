@@ -304,10 +304,26 @@ describe("stale provider config cleanup", () => {
 	});
 
 	test("leaves models.json alone when a number would not round-trip exactly", async () => {
-		const content = '{\n  "providers": {\n    "llm2": {"models": []},\n    "other": {"quirk": 9007199254740993}\n  }\n}\n';
-		const path = writeConfig(".pi", "models.json", content);
+		for (const literal of ["9007199254740993", "9.007199254740993e15"]) {
+			const content = `{\n  "providers": {\n    "llm2": {"models": []},\n    "other": {"quirk": ${literal}}\n  }\n}\n`;
+			const path = writeConfig(".pi", "models.json", content);
+			await extension(piHarness().pi as never);
+			expect(readFileSync(path, "utf-8")).toBe(content);
+		}
+	});
+
+	test("still cleans up when digits appear inside strings", async () => {
+		// `08` inside a date would look unpreservable if strings were scanned.
+		const path = writeConfig(".pi", "models.json", JSON.stringify({
+			providers: {
+				llm2: { models: [] },
+				other: { baseUrl: "http://gpu22:30001/v1", note: "2026-08-20", cost: 0.5 },
+			},
+		}, null, 2) + "\n");
 		await extension(piHarness().pi as never);
-		expect(readFileSync(path, "utf-8")).toBe(content);
+		const after = JSON.parse(readFileSync(path, "utf-8"));
+		expect(Object.keys(after.providers)).toEqual(["other"]);
+		expect(after.providers.other.note).toBe("2026-08-20");
 	});
 
 	test("leaves a file without an llm2 block byte-identical and writes no backup", async () => {
