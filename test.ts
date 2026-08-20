@@ -116,6 +116,13 @@ describe("llm2 provider authentication", () => {
 	});
 });
 
+// Oh My Pi is the client that reads models.yml; Pi reads models.json.
+function ompHarness(namespace: Record<string, unknown> = {}) {
+	const harness = piHarness();
+	(harness.pi as Record<string, unknown>).pi = namespace;
+	return harness;
+}
+
 function writeConfig(client: ".omp" | ".pi", file: string, content: string, profile?: string): string {
 	const dir = profile ? join(sandbox, client, "profiles", profile, "agent") : join(sandbox, client, "agent");
 	mkdirSync(dir, { recursive: true });
@@ -139,7 +146,7 @@ describe("stale provider config cleanup", () => {
 			"      - id: qwen3.5-122b-int4",
 			"",
 		].join("\n"));
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe([
 			"providers:",
 			"  gpu22:",
@@ -164,7 +171,7 @@ describe("stale provider config cleanup", () => {
 			"    models:",
 			"",
 		].join("\n"));
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		const after = readFileSync(path, "utf-8");
 		expect(after).not.toContain("llm2");
 		expect(after).toContain("qwen3.5-122b-int4");
@@ -172,26 +179,26 @@ describe("stale provider config cleanup", () => {
 
 	test("keeps providers a mapping when llm2 was the only entry", async () => {
 		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    baseUrl: https://llm2.yangl.com.cn/v1\n    models:\n");
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe("providers: {}\n");
 	});
 
 	test("keeps providers a mapping when a later top-level section follows", async () => {
 		// `aliases` entries share the provider indentation but are not providers.
 		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    models:\naliases:\n  foo: bar\n");
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe("providers: {}\naliases:\n  foo: bar\n");
 	});
 
 	test("keeps the providers-line comment when the map is emptied", async () => {
 		const path = writeConfig(".omp", "models.yml", "providers: # local catalog\n  llm2:\n    models:\n");
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe("providers: {} # local catalog\n");
 	});
 
 	test("removes a quoted provider key", async () => {
 		const path = writeConfig(".omp", "models.yml", 'providers:\n  "llm2":\n    "apiKey": sk-quoted\n    models:\n  gpu22:\n    baseUrl: http://x/v1\n');
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe("providers:\n  gpu22:\n    baseUrl: http://x/v1\n");
 	});
 
@@ -206,7 +213,7 @@ describe("stale provider config cleanup", () => {
 			"    baseUrl: http://y/v1",
 			"",
 		].join("\n"));
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		const after = readFileSync(path, "utf-8");
 		// The whole block must go; leaving `models:` behind would be invalid YAML.
 		expect(after).not.toContain("llm2");
@@ -218,7 +225,7 @@ describe("stale provider config cleanup", () => {
 
 	test("removes the block when the providers key carries an inline comment", async () => {
 		const path = writeConfig(".omp", "models.yml", "providers: # local catalog\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n");
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		const after = readFileSync(path, "utf-8");
 		expect(after).not.toContain("llm2");
 		expect(after).toContain("providers: # local catalog");
@@ -226,7 +233,7 @@ describe("stale provider config cleanup", () => {
 
 	test("removes the block under a quoted providers key", async () => {
 		const path = writeConfig(".omp", "models.yml", 'providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n'.replace("providers:", '"providers":'));
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
 	});
 
@@ -234,7 +241,7 @@ describe("stale provider config cleanup", () => {
 		// Flow style: the parser sees llm2, the line edit cannot express the removal.
 		const content = "providers: {llm2: {models: null}, gpu22: {baseUrl: http://y/v1}}\n";
 		const path = writeConfig(".omp", "models.yml", content);
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe(content);
 		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
 	});
@@ -243,7 +250,7 @@ describe("stale provider config cleanup", () => {
 		const content = "providers: disabled\n";
 		const path = writeConfig(".omp", "models.yml", content);
 		// Must not throw: a crash here would stop the provider registering at all.
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe(content);
 	});
 
@@ -265,7 +272,7 @@ describe("stale provider config cleanup", () => {
 		const link = join(dir, "models.yml");
 		symlinkSync(real, link);
 
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 
 		expect(lstatSync(link).isSymbolicLink()).toBe(true);
 		expect(readFileSync(real, "utf-8")).not.toContain("llm2");
@@ -276,7 +283,7 @@ describe("stale provider config cleanup", () => {
 		// These files hold API keys; a 0600 config must not come back 0644.
 		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n");
 		chmodSync(path, 0o600);
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
 		expect(statSync(path).mode & 0o777).toBe(0o600);
 	});
@@ -306,7 +313,7 @@ describe("stale provider config cleanup", () => {
 	test("leaves a file without an llm2 block byte-identical and writes no backup", async () => {
 		const content = "providers:\n  gpu22:\n    baseUrl: http://gpu22:30001/v1\n    models:\n      - id: qwen3.5-122b-int4\n";
 		const path = writeConfig(".omp", "models.yml", content);
-		await extension(piHarness().pi as never);
+		await extension(ompHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe(content);
 		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
 	});
@@ -359,23 +366,27 @@ describe("api key handling", () => {
 		expect(notes.join("")).toContain("已存入凭据库");
 	});
 
-	test("Oh My Pi ignores a key found in Pi's config file", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
+	test("Oh My Pi leaves Pi's config file untouched", async () => {
+		// Deleting the other client's block would strip the only copy of its key:
+		// it cannot be authenticated from here, so that client cleans up itself.
+		const piPath = writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
+		const piBefore = readFileSync(piPath, "utf-8");
 		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
 		const stored: Array<{ provider: string; key: string }> = [];
-		const harness = piHarness();
-		(harness.pi as Record<string, unknown>).pi = {
+		const harness = ompHarness({
 			discoverAuthStorage: async () => ({
 				peekApiKey: () => undefined,
 				set: (provider: string, credential: { key: string }) => { stored.push({ provider, key: credential.key }); },
 			}),
-		};
+		});
 		await extension(harness.pi as never);
 		expect(stored).toEqual([{ provider: "llm2", key: "sk-omp-key" }]);
+		expect(readFileSync(piPath, "utf-8")).toBe(piBefore);
 	});
 
-	test("Pi ignores a key found in Oh My Pi's config file", async () => {
-		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
+	test("Pi leaves Oh My Pi's config file untouched", async () => {
+		const ompPath = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
+		const ompBefore = readFileSync(ompPath, "utf-8");
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
 		const logins: Array<{ key: string }> = [];
 		const harness = piHarness();
@@ -388,6 +399,7 @@ describe("api key handling", () => {
 			},
 		});
 		expect(logins).toEqual([{ key: "sk-pi-key" }]);
+		expect(readFileSync(ompPath, "utf-8")).toBe(ompBefore);
 	});
 
 	test("rescues from the active profile, not the unprofiled file", async () => {

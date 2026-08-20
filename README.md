@@ -51,6 +51,11 @@ The extension deletes such a block on startup and backs the original file up as
 `<file>.llm2-purged.bak`. If the block carried an `apiKey`, that key is moved
 into the client's credential store, so no re-login is needed.
 
+Each client only ever touches the config file it reads itself. Cleaning up the
+other client's file from here would delete a block that may hold the only copy
+of its key, which cannot be migrated across clients -- so Pi fixes Pi and Oh My
+Pi fixes Oh My Pi, each on its own next launch.
+
 ## Use
 
 After the Portal administrator enables the Provider and configures the model catalog, select a model such as:

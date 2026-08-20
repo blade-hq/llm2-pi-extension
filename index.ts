@@ -375,7 +375,7 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
-function purgeConfigFile(file: string, providerID: string, activeFile: string, isOMP: boolean): boolean {
+function purgeConfigFile(file: string, providerID: string, isOMP: boolean): boolean {
 	if (!existsSync(file)) return false;
 	let text: string;
 	try {
@@ -386,7 +386,7 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	if (!file.endsWith(".json") && !yamlParser()) {
 		// Say so rather than skipping quietly, but only for the file this client
 		// actually reads: another client's models.yml is its own to clean up.
-		if (file === activeFile && text.includes(providerID)) yamlUnsupported = true;
+		if (text.includes(providerID)) yamlUnsupported = true;
 		return false;
 	}
 	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
@@ -424,54 +424,31 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	// The deleted block may have been the only place the key lived. Keep it so
 	// the session stays usable and the key can be moved into the credential
 	// store once a context is available.
-	if (purged.apiKey && file === activeFile) rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
+	if (purged.apiKey) rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
 	return true;
 }
 
 // The host does not expose its resolved config path to extensions, so mirror
-// the directory rules instead: PI_CONFIG_DIR renames the root, a profile moves
-// it under profiles/<name>/, and PI_CODING_AGENT_DIR overrides the agent dir
-// outright.
+// the directory rules instead: PI_CODING_AGENT_DIR overrides the agent dir
+// outright, otherwise the root is `~/<config dir>` plus, on Oh My Pi, the
+// active profile. PI_CONFIG_DIR and profiles are Oh My Pi's own settings --
+// it names a directory rather than a path, and the host joins it onto the home
+// directory, so an absolute value lands under HOME there too.
 //
-// `active` is the single file the running client actually reads; `sweep` also
-// covers the other client and the inactive profile/root variants. Deleting from
-// all of them is safe -- a stale block only ever breaks the client that reads
-// it -- but a credential may only be taken from `active`, because that is the
-// one whose key this client would otherwise have authenticated with.
-function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
+// Only the file the running client actually reads is touched. Sweeping the
+// other client's config as well would delete a block holding the only copy of
+// its key -- that client cannot be authenticated from here, so its credential
+// would survive only in a backup nothing reads back. Each client cleans up
+// after itself on its own next launch.
+function configPath(isOMP: boolean): string {
 	// Bun caches os.homedir() at startup, so read $HOME first: it is what the
 	// host itself resolves to, and it keeps the cleanup testable.
 	const home = process.env.HOME?.trim() || homedir();
-	// Profiles are an Oh My Pi feature -- Pi reads neither variable, so its
-	// active path must not shift because OMP_PROFILE happens to be exported.
-	// Oh My Pi's own rule is OMP_PROFILE when defined, otherwise PI_PROFILE.
-	const sweepProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim();
-	const profile = isOMP ? sweepProfile : undefined;
-	// PI_CONFIG_DIR is likewise Oh My Pi's alone, and it names a directory
-	// rather than a path -- the host joins it onto the home directory, so an
-	// absolute value lands under HOME there too. Pi never reads it.
-	const sweepConfigDir = process.env.PI_CONFIG_DIR?.trim();
-	const configDir = (isOMP ? sweepConfigDir : undefined) || (isOMP ? ".omp" : ".pi");
+	const profile = isOMP ? (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() : undefined;
+	const configDir = (isOMP && process.env.PI_CONFIG_DIR?.trim()) || (isOMP ? ".omp" : ".pi");
 	const override = process.env.PI_CODING_AGENT_DIR?.trim();
-	const profileSegments = profile ? ["profiles", profile] : [];
-
-	const activeDir = override || join(home, configDir, ...profileSegments, "agent");
-	const active = join(activeDir, isOMP ? "models.yml" : "models.json");
-
-	const dirs = new Set<string>([activeDir]);
-	for (const name of new Set([configDir, sweepConfigDir, ".omp", ".pi"])) {
-		if (!name) continue;
-		dirs.add(join(home, name, "agent"));
-		// Sweep the profile variants regardless of client: deleting a stale block
-		// is safe anywhere, only the credential must come from `active`.
-		if (sweepProfile) dirs.add(join(home, name, "profiles", sweepProfile, "agent"));
-	}
-	const sweep = new Set<string>();
-	for (const dir of dirs) {
-		sweep.add(join(dir, "models.yml"));
-		sweep.add(join(dir, "models.json"));
-	}
-	return { active, sweep: [...sweep] };
+	const agentDir = override || join(home, configDir, ...(profile ? ["profiles", profile] : []), "agent");
+	return join(agentDir, isOMP ? "models.yml" : "models.json");
 }
 
 // Oh My Pi reads `apiKey` as the name of an environment variable and Pi accepts
@@ -503,8 +480,8 @@ function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
 	rescuedKey = undefined;
 	rescueStored = false;
 	yamlUnsupported = false;
-	const { active, sweep } = configPaths(isOMP);
-	return sweep.filter(file => purgeConfigFile(file, providerID, active, isOMP));
+	const file = configPath(isOMP);
+	return purgeConfigFile(file, providerID, isOMP) ? [file] : [];
 }
 
 function registerTools(pi: ExtensionAPI) {
