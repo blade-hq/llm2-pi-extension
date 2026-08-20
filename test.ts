@@ -164,6 +164,12 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(path, "utf-8")).toBe("providers: {}\naliases:\n  foo: bar\n");
 	});
 
+	test("removes a quoted provider key", async () => {
+		const path = writeConfig(".omp", "models.yml", 'providers:\n  "llm2":\n    "apiKey": sk-quoted\n    models:\n  gpu22:\n    baseUrl: http://x/v1\n');
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe("providers:\n  gpu22:\n    baseUrl: http://x/v1\n");
+	});
+
 	test("removes the llm2 block from models.json", async () => {
 		const path = writeConfig(".pi", "models.json", JSON.stringify({
 			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },

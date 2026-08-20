@@ -208,8 +208,13 @@ const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
 // never rewrites a file it does not need to touch.
 type PurgeResult = { text: string; apiKey?: string };
 
+// YAML keys and scalars may be quoted; compare and store the bare text.
+function unquote(value: string): string {
+	return value.replace(/^["']|["']$/g, "");
+}
+
 function yamlValue(line: string): string {
-	return line.slice(line.indexOf(":") + 1).trim().replace(/^["']|["']$/g, "");
+	return unquote(line.slice(line.indexOf(":") + 1).trim());
 }
 
 function purgeYAML(text: string, providerID: string): PurgeResult | null {
@@ -226,7 +231,7 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 		if (!entry) break;
 		if (baseIndent === null) baseIndent = entry[1];
 		if (entry[1] !== baseIndent) continue;
-		if (entry[2] === providerID) { start = i; break; }
+		if (unquote(entry[2]) === providerID) { start = i; break; }
 	}
 	if (start < 0 || baseIndent === null) return null;
 
@@ -237,7 +242,7 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	}
 
 	const removed = lines.slice(start, end);
-	const apiKey = removed.find(line => /^\s+apiKey\s*:/.test(line));
+	const apiKey = removed.find(line => /^\s+["']?apiKey["']?\s*:/.test(line));
 	const kept = [...lines.slice(0, start), ...lines.slice(end)];
 	// A bare `providers:` with no children parses as null and fails the same
 	// schema check this cleanup exists to prevent. Stop at the next top-level
