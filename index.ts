@@ -433,16 +433,9 @@ async function purgeConfigFile(
 	// halfway -- a full disk right after the backup copy, most concretely --
 	// would leave the live config truncated, which is exactly the damage this
 	// cleanup exists to prevent. Rename within a directory is atomic.
-	// Follow symlinks before replacing anything: dotfile managers commonly link
-	// these paths, and renaming onto the link would swap it for a regular file,
-	// silently breaking that setup while the managed original keeps the stale
-	// block -- which the next sync would restore.
-	let target = file;
-	try {
-		target = realpathSync(file);
-	} catch {
-		// Unreadable link: fall back to the path as given.
-	}
+	// Follow symlinks before replacing anything: the managed original is what
+	// the next dotfile sync would restore from.
+	const target = resolveTarget(file);
 	const temp = `${target}.llm2-tmp`;
 	try {
 		// The edit was computed from a snapshot. If another process or a dotfile
@@ -452,14 +445,9 @@ async function purgeConfigFile(
 		// unguarded window is just those two statements. Closing it completely
 		// would need a lock, which is not worth its own failure modes here.
 		if (readFileSync(target, "utf-8") !== text) return false;
-		// These files hold API keys for every provider, and are commonly mode
-		// 0600. A fresh temp file would land on 0644 under the usual umask and
-		// the rename would publish the whole config to other local users, so
-		// carry the original mode over. chmod after the write: the `mode` option
-		// is masked by the umask, an explicit chmod is not.
-		const mode = statSync(target).mode & 0o777;
-		writeFileSync(temp, purged.text);
-		chmodSync(temp, mode);
+		// Carry the original mode over: these files are commonly 0600 and the
+		// rename would otherwise publish every provider's key to other users.
+		writeSecretFile(temp, purged.text, statSync(target).mode & 0o777);
 		if (readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
 			return false;
@@ -631,6 +619,26 @@ type SessionContext = { ui?: { notify?(message: string, type?: string): void } }
 // Pi's credential file. The registry it hands extensions exposes only readers
 // -- no login(), no setter of any kind -- so a key can be moved there only by
 // writing the file, the same way this extension already edits models.json.
+// These files hold API keys, so the temp file must never exist in a readable
+// mode: create it 0600 before writing (umask can only clear bits, never add
+// them), then move it to the destination's own mode. Removing any leftover
+// first matters -- writeFileSync does not apply `mode` to an existing file.
+function writeSecretFile(temp: string, data: string, mode: number): void {
+	rmSync(temp, { force: true });
+	writeFileSync(temp, data, { mode: 0o600 });
+	chmodSync(temp, mode);
+}
+
+// Dotfile managers link credential files too; renaming onto the link would
+// swap it for a regular file and the managed original would never see the key.
+function resolveTarget(file: string): string {
+	try {
+		return realpathSync(file);
+	} catch {
+		return file;
+	}
+}
+
 function authPath(): string {
 	return join(dirname(configPath(false)), "auth.json");
 }
@@ -648,24 +656,22 @@ function readAuthKey(providerID: string): string | undefined {
 }
 
 function writeAuthKey(providerID: string, key: string): boolean {
-	const file = authPath();
-	const temp = `${file}.llm2-tmp`;
+	const target = resolveTarget(authPath());
+	const temp = `${target}.llm2-tmp`;
 	try {
-		const existed = existsSync(file);
-		const text = existed ? readFileSync(file, "utf-8") : "{}";
+		const existed = existsSync(target);
+		const text = existed ? readFileSync(target, "utf-8") : "{}";
 		const parsed = JSON.parse(text) as Record<string, unknown>;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
 		// Never overwrite an entry the user already has, whatever its shape.
 		if (parsed[providerID] !== undefined) return true;
 		parsed[providerID] = { type: "api_key", key };
-		// Credentials: create at 0600 and keep an existing file's mode.
-		writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`);
-		chmodSync(temp, existed ? statSync(file).mode & 0o777 : 0o600);
-		if (existed && readFileSync(file, "utf-8") !== text) {
+		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, existed ? statSync(target).mode & 0o777 : 0o600);
+		if (existed && readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
 			return false;
 		}
-		renameSync(temp, file);
+		renameSync(temp, target);
 		return true;
 	} catch {
 		rmSync(temp, { force: true });

@@ -412,6 +412,23 @@ describe("api key handling", () => {
 		rmSync(authFile(), { recursive: true, force: true });
 	});
 
+	test("writes auth.json through a symlink and keeps it 0600", async () => {
+		const store = join(sandbox, "dotfiles");
+		mkdirSync(store, { recursive: true });
+		const real = join(store, "auth.json");
+		writeFileSync(real, JSON.stringify({ deepseek: { type: "api_key", key: "sk-ds" } }, null, 2));
+		chmodSync(real, 0o600);
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		symlinkSync(real, authFile());
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-through-link", models: [] } } }));
+
+		await extension(piHarness().pi as never);
+
+		expect(lstatSync(authFile()).isSymbolicLink()).toBe(true);
+		expect(JSON.parse(readFileSync(real, "utf-8")).llm2).toEqual({ type: "api_key", key: "sk-through-link" });
+		expect(statSync(real).mode & 0o777).toBe(0o600);
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));
