@@ -500,6 +500,10 @@ describe("api key handling", () => {
 	});
 
 	test("stores a __proto__ provider id as a real entry", async () => {
+		// An existing file takes the merge path, where plain assignment would hit
+		// the inherited setter and store nothing.
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ deepseek: { type: "api_key", key: "sk-ds" } }, null, 2));
 		// Written as text: an object literal's __proto__ key sets the prototype.
 		writeConfig(".pi", "models.json", '{"providers":{"__proto__":{"apiKey":"sk-proto","models":[]}}}');
 		process.env.LLM2_PROVIDER_ID = "__proto__";
