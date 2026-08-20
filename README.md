@@ -82,4 +82,12 @@ This extension has the same local process permissions as Pi or Oh My Pi. Read th
 bun test ./test.ts
 ```
 
-The extension uses the public provider and tool registration APIs. It does not read Pi or Oh My Pi private databases or configuration files.
+The extension registers its provider and tools through the public APIs. Beyond
+that it touches two pieces of client state, both described above:
+
+- **Config files.** It reads `models.json` / `models.yml`, and deletes a stale
+  `providers.llm2` block from them, backing the original up first. Nothing else
+  in those files is modified.
+- **Credential store.** It reads the stored `llm2` key so model discovery works
+  after `/login`, and writes one back only when rescuing a key from a block it
+  is about to delete.

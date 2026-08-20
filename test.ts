@@ -426,6 +426,27 @@ describe("api key handling", () => {
 		}
 	});
 
+	test("Pi ignores PI_CONFIG_DIR when locating its own config", async () => {
+		// PI_CONFIG_DIR is an Oh My Pi setting; Pi never reads it.
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-default-root", models: [] } } }));
+		const logins: Array<{ key: string }> = [];
+		process.env.PI_CONFIG_DIR = ".somewhere-else";
+		try {
+			const harness = piHarness();
+			await extension(harness.pi as never);
+			await harness.sessionStart({
+				modelRegistry: {
+					async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
+						logins.push({ key: await interaction.prompt() });
+					},
+				},
+			});
+			expect(logins).toEqual([{ key: "sk-pi-default-root" }]);
+		} finally {
+			delete process.env.PI_CONFIG_DIR;
+		}
+	});
+
 	test("Pi keeps an uppercase literal key instead of treating it as a reference", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "ABC123", models: [] } } }));
 		const logins: Array<{ key: string }> = [];

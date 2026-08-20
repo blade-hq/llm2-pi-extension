@@ -425,7 +425,11 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 	// Oh My Pi's own rule is OMP_PROFILE when defined, otherwise PI_PROFILE.
 	const sweepProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim();
 	const profile = isOMP ? sweepProfile : undefined;
-	const configDir = process.env.PI_CONFIG_DIR?.trim() || (isOMP ? ".omp" : ".pi");
+	// PI_CONFIG_DIR is likewise Oh My Pi's alone, and it names a directory
+	// rather than a path -- the host joins it onto the home directory, so an
+	// absolute value lands under HOME there too. Pi never reads it.
+	const sweepConfigDir = process.env.PI_CONFIG_DIR?.trim();
+	const configDir = (isOMP ? sweepConfigDir : undefined) || (isOMP ? ".omp" : ".pi");
 	const override = process.env.PI_CODING_AGENT_DIR?.trim();
 	const profileSegments = profile ? ["profiles", profile] : [];
 
@@ -433,7 +437,8 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 	const active = join(activeDir, isOMP ? "models.yml" : "models.json");
 
 	const dirs = new Set<string>([activeDir]);
-	for (const name of new Set([configDir, ".omp", ".pi"])) {
+	for (const name of new Set([configDir, sweepConfigDir, ".omp", ".pi"])) {
+		if (!name) continue;
 		dirs.add(join(home, name, "agent"));
 		// Sweep the profile variants regardless of client: deleting a stale block
 		// is safe anywhere, only the credential must come from `active`.
