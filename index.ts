@@ -1,3 +1,16 @@
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -37,10 +50,22 @@ function baseURL(): string {
 	return env("LLM2_BASE_URL", DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
+// An api key read out of a provider block just before it was deleted, kept only
+// while it has nowhere else to live: once the host stores it, the host owns it.
+let rescuedKey: string | undefined;
+// "stored" = handed to the credential store, "session" = held here because that
+// failed. Undefined means there was nothing worth rescuing.
+let rescueOutcome: "stored" | "session" | undefined;
+// The running client reads YAML but this runtime cannot parse it.
+let yamlUnsupported = false;
+
 function portalKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
-	return process.env.LLM2_API_KEY?.trim() || undefined;
+	// No cached host key: a credential removed by /logout must stop working
+	// immediately, so callers resolve the live one themselves. `rescuedKey` is
+	// not a host credential -- it only survives when the store refused it.
+	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
 }
 
 function catalogURL(base: string): string {
@@ -110,7 +135,9 @@ async function fetchCatalog(signal: AbortSignal | undefined, key: string): Promi
 	}
 }
 
-async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
+// Only consults the host's credential store, so callers can tell a key the
+// host has already persisted from one this extension is carrying in memory.
+async function keyFromRegistry(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const registry = ctx.modelRegistry as {
 		getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
@@ -131,7 +158,17 @@ async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string 
 		const key = auth?.auth?.apiKey?.trim();
 		if (key) return key;
 	}
-	return portalKey();
+	return undefined;
+}
+
+async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
+	const key = await keyFromRegistry(ctx);
+	if (key) return key;
+	// With a context the registry is the live credential source, so never fall
+	// back to something it handed over earlier -- that would outlive /logout.
+	// A rescued key is different: it is only still here because the store would
+	// not take it, so the tools would otherwise have no credential at all.
+	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
 }
 
 async function portalRequest(
@@ -180,6 +217,317 @@ async function generateImage(
 	const url = data?.[0]?.url;
 	if (!url) throw new Error("图片接口没有返回图片链接");
 	return url;
+}
+
+const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
+
+// Remove a top-level `providers.<id>` block while leaving the rest of the file
+// byte-identical. Returns null when there is nothing to remove, so the caller
+// never rewrites a file it does not need to touch.
+type PurgeResult = { text: string; apiKey?: string };
+
+// YAML keys may be quoted; compare against the bare text.
+function unquote(value: string): string {
+	return value.replace(/^["']|["']$/g, "");
+}
+
+type Providers = Record<string, { apiKey?: unknown } | null>;
+type ConfigShape = { providers?: unknown };
+
+// A malformed file can hold anything under `providers` -- `providers: disabled`
+// parses to a string. Without this check the `in` test below throws and takes
+// the whole extension down, which is worse than the stale block it came for.
+function providersOf(parsed: ConfigShape | undefined): Providers | undefined {
+	const providers = parsed?.providers;
+	return providers && typeof providers === "object" && !Array.isArray(providers)
+		? (providers as Providers)
+		: undefined;
+}
+
+// Oh My Pi runs on Bun (its own engines field requires >=1.3.14, which ships
+// Bun.YAML) and is the client that reads models.yml; Pi runs on Node and reads
+// models.json. Without a parser this extension will not edit YAML at all: a
+// hand-rolled parse cannot be trusted to leave a working file working, and a
+// broken models.yml takes every provider down with it.
+function yamlParser(): { parse(text: string): unknown } | undefined {
+	return (globalThis as { Bun?: { YAML?: { parse(text: string): unknown } } }).Bun?.YAML;
+}
+
+function parseYAML(text: string): ConfigShape | undefined {
+	const yaml = yamlParser();
+	if (!yaml) return undefined;
+	try {
+		const parsed = yaml.parse(text);
+		return parsed && typeof parsed === "object" ? (parsed as ConfigShape) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// Line-level edit so comments, indentation style and trailing whitespace in the
+// rest of the file survive. Bun.YAML.stringify() would round-trip the document
+// into one flow-style line, which is a worse outcome than a stale block.
+function removeYAMLBlock(text: string, providerID: string): string | null {
+	const lines = text.split("\n");
+	// The value must be empty (a block mapping follows), but an inline comment
+	// may sit after the colon.
+	const root = lines.findIndex(line => /^["']?providers["']?\s*:\s*(#.*)?$/.test(line));
+	if (root < 0) return null;
+
+	const isSkippable = (line: string) => !line.trim() || line.trim().startsWith("#");
+
+	let start = -1;
+	let baseIndent: string | null = null;
+	for (let i = root + 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (isSkippable(line)) continue;
+		// Only a top-level key ends the providers mapping. Everything indented
+		// belongs to some provider -- including sequence items like `- id: x`,
+		// which match no key pattern; stopping at those would hide any provider
+		// listed after one that spells out its models.
+		if (!/^\s/.test(line)) break;
+		const entry = /^(\s+)([^\s:]+)\s*:/.exec(line);
+		if (!entry) continue;
+		if (baseIndent === null) baseIndent = entry[1];
+		if (entry[1] !== baseIndent) continue;
+		if (unquote(entry[2]) === providerID) { start = i; break; }
+	}
+	if (start < 0 || baseIndent === null) return null;
+
+	let end = lines.length;
+	for (let i = start + 1; i < lines.length; i++) {
+		// Comments belong to the block, not to its end: treating an unindented
+		// comment as the terminator would delete only the first half of the
+		// block and leave its remaining properties dangling.
+		if (isSkippable(lines[i])) continue;
+		if ((/^\s*/.exec(lines[i]) as RegExpExecArray)[0].length <= baseIndent.length) { end = i; break; }
+	}
+	// Give trailing comments and blank lines back to whatever follows.
+	while (end > start + 1 && isSkippable(lines[end - 1])) end--;
+
+	const kept = [...lines.slice(0, start), ...lines.slice(end)];
+	// A bare `providers:` with no children parses as null and fails the same
+	// schema check this cleanup exists to prevent. Stop at the next top-level
+	// key: entries under a later section such as `aliases:` are not providers.
+	let survivor = false;
+	for (let i = root + 1; i < kept.length && !survivor; i++) {
+		const line = kept[i];
+		if (isSkippable(line)) continue;
+		if (!/^\s/.test(line)) break;
+		const entry = /^(\s+)[^\s:]+\s*:/.exec(line);
+		survivor = entry?.[1] === baseIndent;
+	}
+	if (!survivor) {
+		// Insert `{}` in place, keeping the key's own spelling and any inline
+		// comment: those belong to the surviving `providers` key, not to the
+		// block being removed. Verification would not catch their loss, since
+		// YAML parsing ignores comments.
+		const rootLine = kept[root];
+		const comment = /\s(#.*)$/.exec(rootLine)?.[1];
+		const key = rootLine.slice(0, rootLine.indexOf(":") + 1);
+		kept[root] = comment ? `${key} {} ${comment}` : `${key} {}`;
+	}
+	const result = kept.join("\n");
+	// Dropping a trailing block also drops the file's final newline.
+	return text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result;
+}
+
+// The parser decides what is there and what the edit must produce; the line
+// edit only supplies the formatting. Anything the edit cannot express exactly
+// -- an unrecognized spelling, a comment layout that shifts a boundary -- fails
+// this check and the file is left alone rather than rewritten into something
+// the client cannot load.
+function purgeYAML(text: string, providerID: string): PurgeResult | null {
+	const before = parseYAML(text);
+	const providers = providersOf(before);
+	if (!providers || !Object.hasOwn(providers, providerID)) return null;
+
+	const edited = removeYAMLBlock(text, providerID);
+	if (edited === null) return null;
+
+	const expected = { ...before, providers: { ...providers } };
+	delete expected.providers[providerID];
+	if (JSON.stringify(parseYAML(edited)) !== JSON.stringify(expected)) return null;
+
+	const apiKey = providers[providerID]?.apiKey;
+	return {
+		text: edited,
+		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
+	};
+}
+
+// Numeric literals outside string values. Scanning the raw text would also pick
+// up digits inside strings -- a `"2026-08-20"` would look like the unpreservable
+// literal `08` -- so track string state while walking.
+function numericTokens(text: string): string[] {
+	const tokens: string[] = [];
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (escaped) { escaped = false; continue; }
+		if (ch === "\\") { escaped = inString; continue; }
+		if (ch === '"') { inString = !inString; continue; }
+		if (inString) continue;
+		if (ch !== "-" && (ch < "0" || ch > "9")) continue;
+		const token = /^-?\d[\d.]*(?:[eE][+-]?\d+)?/.exec(text.slice(i))?.[0];
+		if (!token) continue;
+		tokens.push(token);
+		i += token.length - 1;
+	}
+	return tokens;
+}
+
+function purgeJSON(text: string, providerID: string): PurgeResult | null {
+	// Re-serializing rewrites every number through Number, so any literal that
+	// does not survive that trip unchanged -- past IEEE-754 exactness, or in
+	// exponent/padded notation -- would come back altered in a provider this
+	// cleanup never meant to touch. String(Number(x)) is JS's shortest
+	// round-trip form, which is precisely what JSON.stringify emits.
+	if (numericTokens(text).some(token => String(Number(token)) !== token)) return null;
+	let parsed: ConfigShape;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	const providers = providersOf(parsed);
+	if (!providers || !Object.hasOwn(providers, providerID)) return null;
+	const apiKey = providers[providerID]?.apiKey;
+	delete providers[providerID];
+	// Re-serializing loses the original layout, so follow the file's own
+	// indentation and final-newline style. Key order survives JSON.stringify.
+	const indent = /\n([ \t]+)/.exec(text)?.[1];
+	const serialized = indent ? JSON.stringify(parsed, null, indent) : JSON.stringify(parsed);
+	return {
+		text: text.endsWith("\n") ? `${serialized}\n` : serialized,
+		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
+	};
+}
+
+function purgeConfigFile(file: string, providerID: string, isOMP: boolean): boolean {
+	if (!existsSync(file)) return false;
+	let text: string;
+	try {
+		text = readFileSync(file, "utf-8");
+	} catch {
+		return false;
+	}
+	if (!file.endsWith(".json") && !yamlParser()) {
+		// Say so rather than skipping quietly, but only for the file this client
+		// actually reads: another client's models.yml is its own to clean up.
+		if (text.includes(providerID)) yamlUnsupported = true;
+		return false;
+	}
+	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
+	if (purged === null) return false;
+	// Write a sibling and rename it into place: a direct write that fails
+	// halfway -- a full disk right after the backup copy, most concretely --
+	// would leave the live config truncated, which is exactly the damage this
+	// cleanup exists to prevent. Rename within a directory is atomic.
+	// Follow symlinks before replacing anything: dotfile managers commonly link
+	// these paths, and renaming onto the link would swap it for a regular file,
+	// silently breaking that setup while the managed original keeps the stale
+	// block -- which the next sync would restore.
+	let target = file;
+	try {
+		target = realpathSync(file);
+	} catch {
+		// Unreadable link: fall back to the path as given.
+	}
+	const temp = `${target}.llm2-tmp`;
+	try {
+		// The edit was computed from a snapshot. If another process or a dotfile
+		// sync rewrote the file since, renaming over it would discard that edit
+		// silently, so re-read and bail out instead. Checked once up front to
+		// avoid pointless work, then again immediately before the rename so the
+		// unguarded window is just those two statements. Closing it completely
+		// would need a lock, which is not worth its own failure modes here.
+		if (readFileSync(target, "utf-8") !== text) return false;
+		// These files hold API keys for every provider, and are commonly mode
+		// 0600. A fresh temp file would land on 0644 under the usual umask and
+		// the rename would publish the whole config to other local users, so
+		// carry the original mode over. chmod after the write: the `mode` option
+		// is masked by the umask, an explicit chmod is not.
+		const mode = statSync(target).mode & 0o777;
+		writeFileSync(temp, purged.text);
+		chmodSync(temp, mode);
+		if (readFileSync(target, "utf-8") !== text) {
+			rmSync(temp, { force: true });
+			return false;
+		}
+		// Back up last, so a mismatch above never leaves a backup of a file that
+		// was not replaced.
+		copyFileSync(target, `${target}${PURGE_BACKUP_SUFFIX}`);
+		renameSync(temp, target);
+	} catch {
+		rmSync(temp, { force: true });
+		return false;
+	}
+	// The deleted block may have been the only place the key lived. Keep it so
+	// the session stays usable and the key can be moved into the credential
+	// store once a context is available.
+	if (purged.apiKey) {
+		rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
+		if (rescuedKey) rescueOutcome = "session";
+	}
+	return true;
+}
+
+// The host does not expose its resolved config path to extensions, so mirror
+// the directory rules instead: PI_CODING_AGENT_DIR overrides the agent dir
+// outright, otherwise the root is `~/<config dir>` plus, on Oh My Pi, the
+// active profile. PI_CONFIG_DIR and profiles are Oh My Pi's own settings --
+// it names a directory rather than a path, and the host joins it onto the home
+// directory, so an absolute value lands under HOME there too.
+//
+// Only the file the running client actually reads is touched. Sweeping the
+// other client's config as well would delete a block holding the only copy of
+// its key -- that client cannot be authenticated from here, so its credential
+// would survive only in a backup nothing reads back. Each client cleans up
+// after itself on its own next launch.
+function configPath(isOMP: boolean): string {
+	// Bun caches os.homedir() at startup, so read $HOME first: it is what the
+	// host itself resolves to, and it keeps the cleanup testable.
+	const home = process.env.HOME?.trim() || homedir();
+	const profile = isOMP ? (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() : undefined;
+	const configDir = (isOMP && process.env.PI_CONFIG_DIR?.trim()) || (isOMP ? ".omp" : ".pi");
+	const override = process.env.PI_CODING_AGENT_DIR?.trim();
+	const agentDir = override || join(home, configDir, ...(profile ? ["profiles", profile] : []), "agent");
+	return join(agentDir, isOMP ? "models.yml" : "models.json");
+}
+
+// Oh My Pi reads `apiKey` as the name of an environment variable and Pi accepts
+// $NAME / ${NAME} interpolation, so the field is not necessarily a secret.
+// Storing the reference text verbatim would put an unusable value in the
+// credential store, which only surfaces on a later launch without that variable
+// set -- after the working block is already gone. Resolve references, and skip
+// the migration when one resolves to nothing.
+function resolveKeyReference(value: string, isOMP: boolean): string | undefined {
+	const interpolated = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
+	if (interpolated) return process.env[interpolated[1]]?.trim() || undefined;
+	// The bare-name form is Oh My Pi's alone -- in Pi the same spelling is a
+	// literal key, and treating it as a reference would discard a usable one.
+	if (!isOMP) return value;
+	// Env names are case-sensitive, so do not restrict the spelling: look the
+	// value up as written. Failing that, decide by shape -- something that could
+	// be an env name is an unset reference and must not be stored, while a
+	// spelling no env name can have (`sk-…`, dots, slashes) is a literal key.
+	const resolved = process.env[value]?.trim();
+	if (resolved) return resolved;
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) ? undefined : value;
+}
+
+// A hand-written provider block shadows the one this extension registers, and a
+// half-written one (`models:` with no value) fails schema validation and takes
+// the whole config file down with it -- every other provider in the file stops
+// resolving. Clearing it on startup keeps registration the single source.
+function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
+	rescuedKey = undefined;
+	rescueOutcome = undefined;
+	yamlUnsupported = false;
+	const file = configPath(isOMP);
+	return purgeConfigFile(file, providerID, isOMP) ? [file] : [];
 }
 
 function registerTools(pi: ExtensionAPI) {
@@ -235,14 +583,131 @@ function registerTools(pi: ExtensionAPI) {
 	});
 }
 
+type AuthStorageLike = {
+	peekApiKey?(providerID: string): Promise<string | undefined> | string | undefined;
+	set?(providerID: string, credential: { type: string; key: string }): Promise<void> | void;
+};
+
+// Oh My Pi exposes its credential store on the extension api itself, which is
+// reachable at load time -- early enough to seed the catalog before the host
+// resolves --model. Pi has no equivalent at load time and goes through
+// modelRegistry at session_start instead.
+async function ompAuthStorage(pi: unknown): Promise<AuthStorageLike | undefined> {
+	const ns = (pi as { pi?: { discoverAuthStorage?: () => Promise<AuthStorageLike> } }).pi;
+	if (typeof ns?.discoverAuthStorage !== "function") return undefined;
+	try {
+		return await ns.discoverAuthStorage();
+	} catch {
+		return undefined;
+	}
+}
+
+async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+	try {
+		const key = await storage?.peekApiKey?.(providerID);
+		return typeof key === "string" && key.trim() ? key.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function storeKey(storage: AuthStorageLike | undefined, providerID: string, key: string): Promise<boolean> {
+	if (typeof storage?.set !== "function") return false;
+	try {
+		await storage.set(providerID, { type: "api_key", key });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+type SessionContext = {
+	ui?: { notify?(message: string, type?: string): void };
+	modelRegistry?: unknown;
+};
+
+// Move a rescued key into the host's credential store so it survives the
+// deletion. This is the Pi path -- Oh My Pi stores the key at load time,
+// before the catalog fetch that needs it.
+async function persistRescuedKey(providerID: string, ctx: SessionContext): Promise<boolean> {
+	const key = rescuedKey;
+	const registry = ctx.modelRegistry as
+		| { login?: (provider: string, type: string, interaction: unknown) => Promise<unknown> }
+		| undefined;
+	if (!key || typeof registry?.login !== "function") return false;
+	// The provider registers an oauth-shaped flow, but ask for the api_key form
+	// too: which one a host offers depends on how it composed the provider.
+	for (const type of ["oauth", "api_key"]) {
+		try {
+			await registry.login(providerID, type, { prompt: async () => key, notify: () => {} });
+			rescuedKey = undefined;
+			rescueOutcome = "stored";
+			return true;
+		} catch {
+			// Try the next credential type.
+		}
+	}
+	return false;
+}
+
+async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
+	const key = await keyFromRegistry(ctx).catch(() => undefined);
+	if (key) {
+		// The host can already authenticate; the deleted block's key is redundant.
+		rescuedKey = undefined;
+		rescueOutcome = undefined;
+	} else if (rescueOutcome === "session") {
+		await persistRescuedKey(providerID, ctx);
+	}
+
+	const notes: string[] = [];
+	if (purged.length > 0) {
+		notes.push(
+			`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider，原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
+		);
+	}
+	if (rescueOutcome === "stored") {
+		notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
+	} else if (rescueOutcome === "session") {
+		notes.push(`其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`);
+	}
+	if (yamlUnsupported) {
+		notes.push(
+			`本地配置里还有遗留的 ${providerID} provider 配置，但当前运行时没有 YAML 解析器（需要 Bun 1.3.14 及以上），无法安全清理，请升级后重启或手动删除该配置块。`,
+		);
+	}
+	if (notes.length > 0) ctx.ui?.notify?.(notes.join(""), "warning");
+}
+
 export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
+	const purged = purgeLegacyProvider(providerID, isOMP);
+
+	// Read the host credential before building the provider config: on Oh My Pi
+	// this is the only chance to publish models early enough for --model to
+	// resolve, and it is where a rescued key has to land to survive the purge.
+	const storage = await ompAuthStorage(pi);
+	let stored = await storedKey(storage, providerID);
+	if (rescuedKey && stored) {
+		// The store can already authenticate; the deleted block's key is redundant.
+		rescuedKey = undefined;
+		rescueOutcome = undefined;
+	} else if (rescuedKey) {
+		const rescued = rescuedKey;
+		if (await storeKey(storage, providerID, rescued)) {
+			rescuedKey = undefined;
+			rescueOutcome = "stored";
+			// It lives in the store now, so it is the live credential for this
+			// load too -- the catalog fetch below still needs it.
+			stored = rescued;
+		}
+	}
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
 	// as an environment-variable name while Pi accepts interpolation syntax.
 	// A literal resolved value works in both clients and remains in process memory.
-	const apiKey = process.env.LLM2_API_KEY?.trim() || undefined;
+	const apiKey = stored || portalKey();
 
 	const providerConfig = {
 		name: providerName,
@@ -262,7 +727,10 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 			return catalog.models;
 		},
 		fetchDynamicModels: async (key?: string) => {
-			const resolved = key?.trim() || portalKey();
+			// Oh My Pi passes neither a credential nor a context here, so read the
+			// live one from its store on every call. A snapshot taken at load time
+			// would keep working after /logout.
+			const resolved = key?.trim() || (await storedKey(await ompAuthStorage(pi), providerID)) || portalKey();
 			if (!resolved) throw new Error("没有 Portal API Key，请设置 LLM2_API_KEY");
 			const catalog = await fetchCatalog(new AbortController().signal, resolved);
 			return catalog.models;
@@ -284,21 +752,28 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 		},
 	} as any;
 
+	// Seed Oh My Pi's synchronous model list so --model resolves during startup;
+	// its dynamic discovery runs too late for that. Register exactly once:
+	// a second registration replaces the first, so re-registering without models
+	// would throw the catalog away and leave every llm2 model unresolvable.
+	let initialModels: ModelConfig[] | undefined;
+	if (isOMP && apiKey) {
+		try {
+			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
+		} catch {
+			// Portal unreachable at startup: the host's cached catalog still applies.
+		}
+	}
 	// Use the config-form provider on both clients. createProvider() from a
 	// locally installed pi-ai can disagree with the host Pi about the refresh
 	// context (store vs publish) and abort the /model catalog update.
-	if (isOMP && apiKey) {
-		try {
-			const initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
-			// Seed OMP's synchronous model list so --model can resolve during startup.
-			// Register the dynamic provider immediately afterwards; keeping that
-			// registration model-free preserves refresh and credential rotation.
-			pi.registerProvider(providerID, { ...providerConfig, models: initialModels });
-		} catch {
-			// OMP's dynamic catalog cache remains available when the Portal cannot
-			// be reached during startup.
-		}
-	}
-	pi.registerProvider(providerID, providerConfig);
+	pi.registerProvider(providerID, initialModels?.length ? { ...providerConfig, models: initialModels } : providerConfig);
 	registerTools(pi);
+
+	const host = pi as unknown as {
+		on?(event: string, handler: (event: unknown, ctx: SessionContext) => Promise<void>): void;
+	};
+	if (typeof host.on === "function") {
+		host.on("session_start", (_event, ctx) => onSessionStart(providerID, purged, ctx));
+	}
 }
