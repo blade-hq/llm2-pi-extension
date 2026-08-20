@@ -2,6 +2,7 @@ import {
 	chmodSync,
 	copyFileSync,
 	existsSync,
+	lstatSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -442,6 +443,7 @@ async function purgeConfigFile(
 	// Follow symlinks before replacing anything: the managed original is what
 	// the next dotfile sync would restore from.
 	const target = resolveTarget(file);
+	if (!target) return false;
 	const temp = `${target}.llm2-tmp`;
 	try {
 		// The edit was computed from a snapshot. If another process or a dotfile
@@ -637,10 +639,17 @@ function writeSecretFile(temp: string, data: string, mode: number): void {
 
 // Dotfile managers link credential files too; renaming onto the link would
 // swap it for a regular file and the managed original would never see the key.
-function resolveTarget(file: string): string {
+// Undefined means the path cannot be written safely: a dangling link resolves
+// to nothing, and writing there would destroy the link a later sync expects.
+function resolveTarget(file: string): string | undefined {
 	try {
 		return realpathSync(file);
 	} catch {
+		try {
+			if (lstatSync(file).isSymbolicLink()) return undefined;
+		} catch {
+			// Nothing at that path: it is its own target.
+		}
 		return file;
 	}
 }
@@ -663,6 +672,7 @@ function readAuthKey(providerID: string): string | undefined {
 
 function writeAuthKey(providerID: string, key: string): boolean {
 	const target = resolveTarget(authPath());
+	if (!target) return false;
 	const temp = `${target}.llm2-tmp`;
 	try {
 		const existed = existsSync(target);

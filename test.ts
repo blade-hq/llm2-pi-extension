@@ -454,6 +454,16 @@ describe("api key handling", () => {
 		expect(readAuth().llm2).toEqual({ type: "oauth", access: "tok", refresh: "tok" } as never);
 	});
 
+	test("does not replace a dangling auth.json symlink", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		symlinkSync(join(sandbox, "dotfiles", "missing-auth.json"), authFile());
+		const content = JSON.stringify({ providers: { llm2: { apiKey: "sk-only-copy", models: [] } } });
+		const path = writeConfig(".pi", "models.json", content);
+		await extension(piHarness().pi as never);
+		expect(lstatSync(authFile()).isSymbolicLink()).toBe(true);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));
