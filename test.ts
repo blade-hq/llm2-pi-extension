@@ -157,6 +157,13 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(path, "utf-8")).toBe("providers: {}\n");
 	});
 
+	test("keeps providers a mapping when a later top-level section follows", async () => {
+		// `aliases` entries share the provider indentation but are not providers.
+		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    models:\naliases:\n  foo: bar\n");
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe("providers: {}\naliases:\n  foo: bar\n");
+	});
+
 	test("removes the llm2 block from models.json", async () => {
 		const path = writeConfig(".pi", "models.json", JSON.stringify({
 			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },
@@ -219,6 +226,37 @@ describe("api key handling", () => {
 		});
 		expect(logins).toEqual([{ provider: "llm2", type: "oauth", key: "sk-rescued-pi" }]);
 		expect(notes.join("")).toContain("已存入凭据库");
+	});
+
+	test("Oh My Pi ignores a key found in Pi's config file", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
+		const stored: Array<{ provider: string; key: string }> = [];
+		const harness = piHarness();
+		(harness.pi as Record<string, unknown>).pi = {
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => undefined,
+				set: (provider: string, credential: { key: string }) => { stored.push({ provider, key: credential.key }); },
+			}),
+		};
+		await extension(harness.pi as never);
+		expect(stored).toEqual([{ provider: "llm2", key: "sk-omp-key" }]);
+	});
+
+	test("Pi ignores a key found in Oh My Pi's config file", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
+		const logins: Array<{ key: string }> = [];
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		await harness.sessionStart({
+			modelRegistry: {
+				async login(_provider: string, _type: string, interaction: { prompt(): Promise<string> }) {
+					logins.push({ key: await interaction.prompt() });
+				},
+			},
+		});
+		expect(logins).toEqual([{ key: "sk-pi-key" }]);
 	});
 
 	test("a rescued key is not re-stored when the host already has one", async () => {

@@ -240,8 +240,16 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	const apiKey = removed.find(line => /^\s+apiKey\s*:/.test(line));
 	const kept = [...lines.slice(0, start), ...lines.slice(end)];
 	// A bare `providers:` with no children parses as null and fails the same
-	// schema check this cleanup exists to prevent.
-	const survivor = kept.slice(root + 1).some(line => line.startsWith(baseIndent) && /^\s+[^\s:]+\s*:/.test(line));
+	// schema check this cleanup exists to prevent. Stop at the next top-level
+	// key: entries under a later section such as `aliases:` are not providers.
+	let survivor = false;
+	for (let i = root + 1; i < kept.length && !survivor; i++) {
+		const line = kept[i];
+		if (!line.trim() || line.trim().startsWith("#")) continue;
+		if (!/^\s/.test(line)) break;
+		const entry = /^(\s+)[^\s:]+\s*:/.exec(line);
+		survivor = entry?.[1] === baseIndent;
+	}
 	if (!survivor) kept[root] = "providers: {}";
 	const result = kept.join("\n");
 	// Dropping a trailing block also drops the file's final newline.
@@ -267,7 +275,7 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
-function purgeConfigFile(file: string, providerID: string): boolean {
+function purgeConfigFile(file: string, providerID: string, hostFile: string): boolean {
 	if (!existsSync(file)) return false;
 	let text: string;
 	try {
@@ -285,8 +293,10 @@ function purgeConfigFile(file: string, providerID: string): boolean {
 	}
 	// The deleted block may have been the only place the key lived. Keep it so
 	// the session stays usable and the key can be moved into the credential
-	// store once a context is available.
-	if (purged.apiKey && !rescuedKey) rescuedKey = purged.apiKey;
+	// store once a context is available. Only the running client's own file
+	// qualifies: the other client's block can hold a different key, and storing
+	// that one here would leave this client authenticating as the wrong account.
+	if (purged.apiKey && !rescuedKey && file.endsWith(hostFile)) rescuedKey = purged.apiKey;
 	return true;
 }
 
@@ -322,10 +332,10 @@ function configFiles(): string[] {
 // half-written one (`models:` with no value) fails schema validation and takes
 // the whole config file down with it -- every other provider in the file stops
 // resolving. Clearing it on startup keeps registration the single source.
-function purgeLegacyProvider(providerID: string): string[] {
+function purgeLegacyProvider(providerID: string, hostFile: string): string[] {
 	rescuedKey = undefined;
 	rescueStored = false;
-	return configFiles().filter(file => purgeConfigFile(file, providerID));
+	return configFiles().filter(file => purgeConfigFile(file, providerID, hostFile));
 }
 
 function registerTools(pi: ExtensionAPI) {
@@ -472,7 +482,9 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
-	const purged = purgeLegacyProvider(providerID);
+	// Oh My Pi reads models.yml, Pi reads models.json. Both are swept, but only
+	// the running client's own file may hand over a credential.
+	const purged = purgeLegacyProvider(providerID, isOMP ? "models.yml" : "models.json");
 
 	// Read the host credential before building the provider config: on Oh My Pi
 	// this is the only chance to publish models early enough for --model to
