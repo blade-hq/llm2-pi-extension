@@ -311,7 +311,16 @@ function removeYAMLBlock(text: string, providerID: string): string | null {
 		const entry = /^(\s+)[^\s:]+\s*:/.exec(line);
 		survivor = entry?.[1] === baseIndent;
 	}
-	if (!survivor) kept[root] = "providers: {}";
+	if (!survivor) {
+		// Insert `{}` in place, keeping the key's own spelling and any inline
+		// comment: those belong to the surviving `providers` key, not to the
+		// block being removed. Verification would not catch their loss, since
+		// YAML parsing ignores comments.
+		const rootLine = kept[root];
+		const comment = /\s(#.*)$/.exec(rootLine)?.[1];
+		const key = rootLine.slice(0, rootLine.indexOf(":") + 1);
+		kept[root] = comment ? `${key} {} ${comment}` : `${key} {}`;
+	}
 	const result = kept.join("\n");
 	// Dropping a trailing block also drops the file's final newline.
 	return text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result;

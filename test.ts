@@ -183,6 +183,12 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(path, "utf-8")).toBe("providers: {}\naliases:\n  foo: bar\n");
 	});
 
+	test("keeps the providers-line comment when the map is emptied", async () => {
+		const path = writeConfig(".omp", "models.yml", "providers: # local catalog\n  llm2:\n    models:\n");
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe("providers: {} # local catalog\n");
+	});
+
 	test("removes a quoted provider key", async () => {
 		const path = writeConfig(".omp", "models.yml", 'providers:\n  "llm2":\n    "apiKey": sk-quoted\n    models:\n  gpu22:\n    baseUrl: http://x/v1\n');
 		await extension(piHarness().pi as never);
