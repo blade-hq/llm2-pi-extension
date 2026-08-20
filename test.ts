@@ -562,6 +562,18 @@ describe("api key handling", () => {
 		expect(stored).toEqual([{ key: "sk-llm2-literal" }]);
 	});
 
+	test("does not tell the user to log in when a stored key already works", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const notes: string[] = [];
+		await harness.sessionStart({
+			ui: { notify: (message: string) => notes.push(message) },
+			modelRegistry: { getApiKeyForProvider: async () => "sk-already-stored" },
+		});
+		expect(notes.join("")).not.toContain("/login");
+	});
+
 	test("a rescued key is not re-stored when the host already has one", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
 		const logins: unknown[] = [];

@@ -638,12 +638,13 @@ async function onSessionStart(providerID: string, purged: string[], ctx: Session
 			`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider，原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
 		);
 	}
-	if (rescuedKey) {
-		notes.push(
-			rescueStored
-				? "其中的 API Key 已存入凭据库，无需重新登录。"
-				: `其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`,
-		);
+	if (rescuedKey && rescueStored) {
+		notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
+	} else if (rescuedKey && !hostKey) {
+		// Only warn when nothing else can authenticate. A stored key means the
+		// rescued one was deliberately not written -- saying it failed would push
+		// the user to overwrite a credential that already works.
+		notes.push(`其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`);
 	}
 	if (yamlUnsupported) {
 		notes.push(
