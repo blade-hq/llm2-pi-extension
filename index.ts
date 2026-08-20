@@ -428,6 +428,22 @@ async function purgeConfigFile(
 	}
 	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
 	if (purged === null) return false;
+
+	// Follow symlinks before replacing anything: the managed original is what
+	// the next dotfile sync would restore from.
+	const target = resolveTarget(file);
+	if (!target) return false;
+
+	// Confirm the snapshot still stands *before* writing to the credential
+	// store. Storing a key from a block that has since been rewritten would
+	// make the new block look redundant on the next launch, and its replacement
+	// key would be deleted while authentication stays pinned to the old one.
+	try {
+		if (readFileSync(target, "utf-8") !== text) return false;
+	} catch {
+		return false;
+	}
+
 	// Settle the key before touching the file. The block may hold the only copy,
 	// and a client whose credential store cannot be written from here has no way
 	// to get it back -- so leave the block in place rather than delete it.
@@ -436,26 +452,18 @@ async function purgeConfigFile(
 		keyBlocked = true;
 		return false;
 	}
+
 	// Write a sibling and rename it into place: a direct write that fails
 	// halfway -- a full disk right after the backup copy, most concretely --
 	// would leave the live config truncated, which is exactly the damage this
 	// cleanup exists to prevent. Rename within a directory is atomic.
-	// Follow symlinks before replacing anything: the managed original is what
-	// the next dotfile sync would restore from.
-	const target = resolveTarget(file);
-	if (!target) return false;
 	const temp = `${target}.llm2-tmp`;
 	try {
-		// The edit was computed from a snapshot. If another process or a dotfile
-		// sync rewrote the file since, renaming over it would discard that edit
-		// silently, so re-read and bail out instead. Checked once up front to
-		// avoid pointless work, then again immediately before the rename so the
-		// unguarded window is just those two statements. Closing it completely
-		// would need a lock, which is not worth its own failure modes here.
-		if (readFileSync(target, "utf-8") !== text) return false;
 		// Carry the original mode over: these files are commonly 0600 and the
 		// rename would otherwise publish every provider's key to other users.
 		writeSecretFile(temp, purged.text, statSync(target).mode & 0o777);
+		// Checked again immediately before the rename, so the unguarded window is
+		// just these two statements.
 		if (readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
 			return false;
