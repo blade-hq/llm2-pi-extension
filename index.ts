@@ -50,11 +50,6 @@ function baseURL(): string {
 	return env("LLM2_BASE_URL", DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
-// Oh My Pi calls fetchDynamicModels() without a credential and without a
-// context, so a key the host already has would otherwise be invisible to the
-// catalog refresh. Both clients hand the extension a context at session_start;
-// cache what it resolves there and fall back to it afterwards.
-let hostKey: string | undefined;
 // An api key read out of a provider block just before it was deleted.
 let rescuedKey: string | undefined;
 // Whether that key made it into the host's credential store.
@@ -65,7 +60,9 @@ let yamlUnsupported = false;
 function portalKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
-	return process.env.LLM2_API_KEY?.trim() || hostKey || rescuedKey;
+	// No cached host key: a credential removed by /logout must stop working
+	// immediately, so callers resolve the live one themselves.
+	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
 }
 
 function catalogURL(base: string): string {
@@ -436,6 +433,11 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 	}
 	const temp = `${target}.llm2-tmp`;
 	try {
+		// The edit was computed from a snapshot. If another process or a dotfile
+		// sync rewrote the file since, renaming over it would discard that edit
+		// silently, so re-read and bail out instead. Checking before the backup
+		// leaves nothing behind when it does not match.
+		if (readFileSync(target, "utf-8") !== text) return false;
 		// These files hold API keys for every provider, and are commonly mode
 		// 0600. A fresh temp file would land on 0644 under the usual umask and
 		// the rename would publish the whole config to other local users, so
@@ -623,7 +625,6 @@ async function persistRescuedKey(providerID: string, ctx: SessionContext): Promi
 	for (const type of ["oauth", "api_key"]) {
 		try {
 			await registry.login(providerID, type, { prompt: async () => key, notify: () => {} });
-			hostKey = key;
 			return true;
 		} catch {
 			// Try the next credential type.
@@ -633,10 +634,7 @@ async function persistRescuedKey(providerID: string, ctx: SessionContext): Promi
 }
 
 async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
-	// Refresh unconditionally rather than only on a hit: a credential removed
-	// since the last session must not survive as a cached fallback.
 	const key = await keyFromRegistry(ctx).catch(() => undefined);
-	hostKey = key;
 	if (rescuedKey && !rescueStored && !key) rescueStored = await persistRescuedKey(providerID, ctx);
 
 	const notes: string[] = [];
@@ -647,7 +645,7 @@ async function onSessionStart(providerID: string, purged: string[], ctx: Session
 	}
 	if (rescuedKey && rescueStored) {
 		notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
-	} else if (rescuedKey && !hostKey) {
+	} else if (rescuedKey && !key) {
 		// Only warn when nothing else can authenticate. A stored key means the
 		// rescued one was deliberately not written -- saying it failed would push
 		// the user to overwrite a credential that already works.
@@ -671,12 +669,12 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	// this is the only chance to publish models early enough for --model to
 	// resolve, and it is where a rescued key has to land to survive the purge.
 	const storage = await ompAuthStorage(pi);
-	hostKey = await storedKey(storage, providerID);
-	if (rescuedKey && !hostKey) rescueStored = await storeKey(storage, providerID, rescuedKey);
+	const stored = await storedKey(storage, providerID);
+	if (rescuedKey && !stored) rescueStored = await storeKey(storage, providerID, rescuedKey);
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
 	// as an environment-variable name while Pi accepts interpolation syntax.
 	// A literal resolved value works in both clients and remains in process memory.
-	const apiKey = portalKey();
+	const apiKey = stored || portalKey();
 
 	const providerConfig = {
 		name: providerName,
@@ -696,7 +694,10 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 			return catalog.models;
 		},
 		fetchDynamicModels: async (key?: string) => {
-			const resolved = key?.trim() || portalKey();
+			// Oh My Pi passes neither a credential nor a context here, so read the
+			// live one from its store on every call. A snapshot taken at load time
+			// would keep working after /logout.
+			const resolved = key?.trim() || (await storedKey(await ompAuthStorage(pi), providerID)) || portalKey();
 			if (!resolved) throw new Error("没有 Portal API Key，请设置 LLM2_API_KEY");
 			const catalog = await fetchCatalog(new AbortController().signal, resolved);
 			return catalog.models;

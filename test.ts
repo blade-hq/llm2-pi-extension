@@ -590,6 +590,15 @@ describe("api key handling", () => {
 		expect(result.content[0]?.text).toContain("没有找到 Portal API Key");
 	});
 
+	test("model refresh stops using a credential removed after load", async () => {
+		let credential: string | undefined = "sk-stored";
+		const harness = ompHarness({ discoverAuthStorage: async () => ({ peekApiKey: () => credential }) });
+		await extension(harness.pi as never);
+		credential = undefined; // /logout while the client stays open
+		const registration = harness.registered as { config: { fetchDynamicModels(key?: string): Promise<unknown> } };
+		expect(registration.config.fetchDynamicModels()).rejects.toThrow("没有 Portal API Key");
+	});
+
 	test("a rescued key is not re-stored when the host already has one", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
 		const logins: unknown[] = [];
