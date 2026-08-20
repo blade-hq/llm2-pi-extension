@@ -289,6 +289,20 @@ describe("stale provider config cleanup", () => {
 		expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual({ providers: { litellm: { baseUrl: "http://x/v1" } } });
 	});
 
+	test("follows the original indentation of models.json", async () => {
+		const path = writeConfig(".pi", "models.json", JSON.stringify(
+			{ providers: { llm2: { models: [] }, litellm: { baseUrl: "http://x/v1" } } }, null, 4) + "\n");
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(JSON.stringify({ providers: { litellm: { baseUrl: "http://x/v1" } } }, null, 4) + "\n");
+	});
+
+	test("leaves models.json alone when a number would not round-trip exactly", async () => {
+		const content = '{\n  "providers": {\n    "llm2": {"models": []},\n    "other": {"quirk": 9007199254740993}\n  }\n}\n';
+		const path = writeConfig(".pi", "models.json", content);
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
 	test("leaves a file without an llm2 block byte-identical and writes no backup", async () => {
 		const content = "providers:\n  gpu22:\n    baseUrl: http://gpu22:30001/v1\n    models:\n      - id: qwen3.5-122b-int4\n";
 		const path = writeConfig(".omp", "models.yml", content);

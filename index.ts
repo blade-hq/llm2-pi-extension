@@ -351,6 +351,10 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 }
 
 function purgeJSON(text: string, providerID: string): PurgeResult | null {
+	// A round trip through Number would silently rewrite integers past 2^53 --
+	// 9007199254740993 comes back as ...992 -- in providers this cleanup never
+	// meant to touch. 16 digits is the shortest length that can exceed it.
+	if (/\d{16,}/.test(text)) return null;
 	let parsed: ConfigShape;
 	try {
 		parsed = JSON.parse(text);
@@ -361,8 +365,12 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	if (!providers || !(providerID in providers)) return null;
 	const apiKey = providers[providerID]?.apiKey;
 	delete providers[providerID];
+	// Re-serializing loses the original layout, so follow the file's own
+	// indentation and final-newline style. Key order survives JSON.stringify.
+	const indent = /\n([ \t]+)/.exec(text)?.[1];
+	const serialized = indent ? JSON.stringify(parsed, null, indent) : JSON.stringify(parsed);
 	return {
-		text: `${JSON.stringify(parsed, null, 2)}\n`,
+		text: text.endsWith("\n") ? `${serialized}\n` : serialized,
 		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
 	};
 }

@@ -86,8 +86,10 @@ The extension registers its provider and tools through the public APIs. Beyond
 that it touches two pieces of client state, both described above:
 
 - **Config files.** It reads `models.json` / `models.yml`, and deletes a stale
-  `providers.llm2` block from them, backing the original up first. Nothing else
-  in those files is modified.
+  `providers.llm2` block from them, backing the original up first. In YAML the
+  rest of the file is left byte-for-byte intact. JSON is re-serialized, keeping
+  key order and the file's own indentation; a file whose numbers exceed what
+  JSON round-trips exactly is left untouched instead.
 - **Credential store.** It reads the stored `llm2` key so model discovery works
   after `/login`, and writes one back only when rescuing a key from a block it
   is about to delete.
