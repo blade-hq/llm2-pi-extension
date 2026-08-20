@@ -464,6 +464,41 @@ describe("api key handling", () => {
 		expect(readFileSync(path, "utf-8")).toBe(content);
 	});
 
+	test("migrates even when the provider id names an inherited property", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ deepseek: { type: "api_key", key: "sk-ds" } }, null, 2));
+		const path = writeConfig(".pi", "models.json", JSON.stringify({ providers: { toString: { apiKey: "sk-weird", models: [] } } }));
+		process.env.LLM2_PROVIDER_ID = "toString";
+		try {
+			await extension(piHarness().pi as never);
+			// Own-property checks: `.toString` would otherwise find the prototype's.
+			expect(Object.hasOwn(readAuth(), "toString")).toBe(true);
+			expect(readAuth().toString).toEqual({ type: "api_key", key: "sk-weird" } as never);
+			expect(Object.hasOwn(JSON.parse(readFileSync(path, "utf-8")).providers, "toString")).toBe(false);
+		} finally {
+			delete process.env.LLM2_PROVIDER_ID;
+		}
+	});
+
+	test("Oh My Pi does not overwrite a credential stored concurrently", async () => {
+		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-from-block\n    models:\n");
+		const sets: string[] = [];
+		let concurrent: string | undefined;
+		const harness = ompHarness({
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => {
+					// Empty at the first look, then a /login lands in another process.
+					const value = concurrent;
+					concurrent = "sk-from-login";
+					return value;
+				},
+				set: (_id: string, credential: { key: string }) => { sets.push(credential.key); },
+			}),
+		});
+		await extension(harness.pi as never);
+		expect(sets).toEqual([]);
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));

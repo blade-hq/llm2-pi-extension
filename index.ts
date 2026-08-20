@@ -671,8 +671,9 @@ function readAuthKey(providerID: string): string | undefined {
 	if (!existsSync(file)) return undefined;
 	try {
 		const parsed = JSON.parse(readFileSync(file, "utf-8")) as Record<string, CredentialLike | undefined>;
+		if (!parsed || typeof parsed !== "object" || !Object.hasOwn(parsed, providerID)) return undefined;
 		// Same shapes portalKey() accepts, so an oauth login counts as stored.
-		return portalCredentialKey(parsed?.[providerID]);
+		return portalCredentialKey(parsed[providerID]);
 	} catch {
 		return undefined;
 	}
@@ -706,7 +707,7 @@ function writeAuthKey(providerID: string, key: string): boolean {
 		// It is not ours to replace, and claiming success would let the caller
 		// delete the block holding the only readable key. Report failure so the
 		// block stays and the user is asked to sort the credential out.
-		if (parsed[providerID] !== undefined) return false;
+		if (Object.hasOwn(parsed, providerID)) return false;
 		parsed[providerID] = entry;
 		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, statSync(target).mode & 0o777);
 		if (readFileSync(target, "utf-8") !== text) {
@@ -755,7 +756,12 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const purged = await purgeLegacyProvider(providerID, isOMP, async key => {
 		// Already able to authenticate: the block's key is redundant, drop it.
 		if (stored) return true;
-		const moved = isOMP ? await storeKey(storage, providerID, key) : writeAuthKey(providerID, key);
+		// Re-read first: another process may have completed /login since the
+		// snapshot above, and overwriting a credential the user just entered
+		// with one from a legacy block would be worse than not migrating.
+		const moved = isOMP
+			? (await storedKey(storage, providerID)) !== undefined || (await storeKey(storage, providerID, key))
+			: writeAuthKey(providerID, key);
 		if (!moved) return false;
 		keyMigrated = true;
 		// It lives in the store now, so it is also the live credential for this
