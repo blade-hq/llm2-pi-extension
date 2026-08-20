@@ -532,6 +532,16 @@ describe("api key handling", () => {
 		expect(readFileSync(path, "utf-8")).toBe(content);
 	});
 
+	test("does not bake a host-managed credential into the provider config", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "api_key", key: "sk-stored" } }, null, 2));
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		// A literal apiKey here would survive /logout until the process restarts.
+		const registration = harness.registered as { config: { apiKey?: string } };
+		expect(registration.config.apiKey).toBeUndefined();
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));

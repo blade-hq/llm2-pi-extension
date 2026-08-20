@@ -799,10 +799,14 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 		stored = key;
 		return true;
 	});
-	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
-	// as an environment-variable name while Pi accepts interpolation syntax.
-	// A literal resolved value works in both clients and remains in process memory.
-	const apiKey = stored || portalKey();
+	// Only used to fetch the catalog below -- deliberately not put into the
+	// provider config.
+	const catalogKey = stored || portalKey();
+	// A credential the host manages must stay live: baking it into the provider
+	// config as a literal would keep authenticating after /logout, since nothing
+	// can clear a value captured here. An explicit LLM2_API_KEY is different --
+	// it is static by nature and the user controls it.
+	const apiKey = process.env.LLM2_API_KEY?.trim() || undefined;
 
 	const providerConfig = {
 		name: providerName,
@@ -852,9 +856,9 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	// a second registration replaces the first, so re-registering without models
 	// would throw the catalog away and leave every llm2 model unresolvable.
 	let initialModels: ModelConfig[] | undefined;
-	if (isOMP && apiKey) {
+	if (isOMP && catalogKey) {
 		try {
-			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
+			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), catalogKey)).models;
 		} catch {
 			// Portal unreachable at startup: the host's cached catalog still applies.
 		}
