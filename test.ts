@@ -191,6 +191,14 @@ describe("stale provider config cleanup", () => {
 		});
 	});
 
+	test("removes the block when the providers key carries an inline comment", async () => {
+		const path = writeConfig(".omp", "models.yml", "providers: # local catalog\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n");
+		await extension(piHarness().pi as never);
+		const after = readFileSync(path, "utf-8");
+		expect(after).not.toContain("llm2");
+		expect(after).toContain("providers: # local catalog");
+	});
+
 	test("removes the block under a quoted providers key", async () => {
 		const path = writeConfig(".omp", "models.yml", 'providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n'.replace("providers:", '"providers":'));
 		await extension(piHarness().pi as never);

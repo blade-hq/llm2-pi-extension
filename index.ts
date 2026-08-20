@@ -234,7 +234,9 @@ function parseYAML(text: string): ConfigShape | undefined {
 // into one flow-style line, which is a worse outcome than a stale block.
 function removeYAMLBlock(text: string, providerID: string): string | null {
 	const lines = text.split("\n");
-	const root = lines.findIndex(line => /^["']?providers["']?\s*:\s*$/.test(line));
+	// The value must be empty (a block mapping follows), but an inline comment
+	// may sit after the colon.
+	const root = lines.findIndex(line => /^["']?providers["']?\s*:\s*(#.*)?$/.test(line));
 	if (root < 0) return null;
 
 	const isSkippable = (line: string) => !line.trim() || line.trim().startsWith("#");
