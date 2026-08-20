@@ -15,8 +15,8 @@ The Portal backend stays private. This repository contains only the code that ru
 Install a fixed Git tag:
 
 ```bash
-pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.5
-omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.5
+pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
+omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
 ```
 
 The same source works with both clients. The package manifest declares both `pi.extensions` and `omp.extensions`.
@@ -48,8 +48,13 @@ then discards the whole config file, so every other provider in it stops
 resolving too.
 
 The extension deletes such a block on startup and backs the original file up as
-`<file>.llm2-purged.bak`. If the block carried an `apiKey`, that key is moved
-into the client's credential store, so no re-login is needed.
+`<file>.llm2-purged.bak`. If the block carried an `apiKey`, that key is first
+moved into the client's credential store — Oh My Pi's store for `omp`,
+`auth.json` for Pi — so no re-login is needed.
+
+If that key cannot be stored, the block is **left in place**: it may hold the
+only copy, and deleting it would lose the credential. The extension then asks
+you to run `/login llm2`; the block is cleaned up on the next launch.
 
 Each client only ever touches the config file it reads itself. Cleaning up the
 other client's file from here would delete a block that may hold the only copy
@@ -97,4 +102,6 @@ that it touches two pieces of client state, both described above:
   JSON round-trips exactly is left untouched instead.
 - **Credential store.** It reads the stored `llm2` key so model discovery works
   after `/login`, and writes one back only when rescuing a key from a block it
-  is about to delete.
+  is about to delete. On Pi that means `auth.json`, written directly: the
+  registry Pi exposes to extensions has readers only, no way to store a
+  credential. An existing entry is never overwritten.

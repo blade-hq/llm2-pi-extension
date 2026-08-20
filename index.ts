@@ -2,6 +2,7 @@ import {
 	chmodSync,
 	copyFileSync,
 	existsSync,
+	lstatSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -10,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -50,22 +51,25 @@ function baseURL(): string {
 	return env("LLM2_BASE_URL", DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
-// An api key read out of a provider block just before it was deleted, kept only
-// while it has nowhere else to live: once the host stores it, the host owns it.
-let rescuedKey: string | undefined;
-// "stored" = handed to the credential store, "session" = held here because that
-// failed. Undefined means there was nothing worth rescuing.
-let rescueOutcome: "stored" | "session" | undefined;
+// Set when a key from the deleted block was moved into the credential store.
+let keyMigrated = false;
+// Set when a block was left in place because its key could not be moved.
+let keyBlocked = false;
 // The running client reads YAML but this runtime cannot parse it.
 let yamlUnsupported = false;
 
-function portalKey(credential?: CredentialLike): string | undefined {
+function portalCredentialKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
+	return undefined;
+}
+
+function portalKey(credential?: CredentialLike): string | undefined {
+	const fromCredential = portalCredentialKey(credential);
+	if (fromCredential) return fromCredential;
 	// No cached host key: a credential removed by /logout must stop working
-	// immediately, so callers resolve the live one themselves. `rescuedKey` is
-	// not a host credential -- it only survives when the store refused it.
-	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
+	// immediately, so callers resolve the live one themselves.
+	return process.env.LLM2_API_KEY?.trim() || undefined;
 }
 
 function catalogURL(base: string): string {
@@ -166,9 +170,7 @@ async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string 
 	if (key) return key;
 	// With a context the registry is the live credential source, so never fall
 	// back to something it handed over earlier -- that would outlive /logout.
-	// A rescued key is different: it is only still here because the store would
-	// not take it, so the tools would otherwise have no credential at all.
-	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
+	return process.env.LLM2_API_KEY?.trim() || undefined;
 }
 
 async function portalRequest(
@@ -405,7 +407,12 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
-function purgeConfigFile(file: string, providerID: string, isOMP: boolean): boolean {
+async function purgeConfigFile(
+	file: string,
+	providerID: string,
+	isOMP: boolean,
+	settleKey: (key: string, snapshotHolds: () => boolean) => Promise<boolean>,
+): Promise<boolean> {
 	if (!existsSync(file)) return false;
 	let text: string;
 	try {
@@ -421,37 +428,54 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 	}
 	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
 	if (purged === null) return false;
+
+	// Follow symlinks before replacing anything: the managed original is what
+	// the next dotfile sync would restore from.
+	const target = resolveTarget(file);
+	if (!target) return false;
+
+	// Confirm the snapshot still stands *before* writing to the credential
+	// store. Storing a key from a block that has since been rewritten would
+	// make the new block look redundant on the next launch, and its replacement
+	// key would be deleted while authentication stays pinned to the old one.
+	try {
+		if (readFileSync(target, "utf-8") !== text) return false;
+	} catch {
+		return false;
+	}
+
+	// Settle the key before touching the file. The block may hold the only copy,
+	// and a client whose credential store cannot be written from here has no way
+	// to get it back -- so leave the block in place rather than delete it.
+	const snapshotHolds = () => {
+		try {
+			return readFileSync(target, "utf-8") === text;
+		} catch {
+			return false;
+		}
+	};
+	if (purged.apiKey) {
+		// An unresolved reference counts as unsettled too: the variable may simply
+		// not be exported yet, and deleting the block would remove the reference
+		// the user expects to start working once it is.
+		const key = resolveKeyReference(purged.apiKey, isOMP);
+		if (!key || !(await settleKey(key, snapshotHolds))) {
+			keyBlocked = true;
+			return false;
+		}
+	}
+
 	// Write a sibling and rename it into place: a direct write that fails
 	// halfway -- a full disk right after the backup copy, most concretely --
 	// would leave the live config truncated, which is exactly the damage this
 	// cleanup exists to prevent. Rename within a directory is atomic.
-	// Follow symlinks before replacing anything: dotfile managers commonly link
-	// these paths, and renaming onto the link would swap it for a regular file,
-	// silently breaking that setup while the managed original keeps the stale
-	// block -- which the next sync would restore.
-	let target = file;
-	try {
-		target = realpathSync(file);
-	} catch {
-		// Unreadable link: fall back to the path as given.
-	}
 	const temp = `${target}.llm2-tmp`;
 	try {
-		// The edit was computed from a snapshot. If another process or a dotfile
-		// sync rewrote the file since, renaming over it would discard that edit
-		// silently, so re-read and bail out instead. Checked once up front to
-		// avoid pointless work, then again immediately before the rename so the
-		// unguarded window is just those two statements. Closing it completely
-		// would need a lock, which is not worth its own failure modes here.
-		if (readFileSync(target, "utf-8") !== text) return false;
-		// These files hold API keys for every provider, and are commonly mode
-		// 0600. A fresh temp file would land on 0644 under the usual umask and
-		// the rename would publish the whole config to other local users, so
-		// carry the original mode over. chmod after the write: the `mode` option
-		// is masked by the umask, an explicit chmod is not.
-		const mode = statSync(target).mode & 0o777;
-		writeFileSync(temp, purged.text);
-		chmodSync(temp, mode);
+		// Carry the original mode over: these files are commonly 0600 and the
+		// rename would otherwise publish every provider's key to other users.
+		writeSecretFile(temp, purged.text, statSync(target).mode & 0o777);
+		// Checked again immediately before the rename, so the unguarded window is
+		// just these two statements.
 		if (readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
 			return false;
@@ -463,13 +487,6 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 	} catch {
 		rmSync(temp, { force: true });
 		return false;
-	}
-	// The deleted block may have been the only place the key lived. Keep it so
-	// the session stays usable and the key can be moved into the credential
-	// store once a context is available.
-	if (purged.apiKey) {
-		rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
-		if (rescuedKey) rescueOutcome = "session";
 	}
 	return true;
 }
@@ -522,12 +539,16 @@ function resolveKeyReference(value: string, isOMP: boolean): string | undefined 
 // half-written one (`models:` with no value) fails schema validation and takes
 // the whole config file down with it -- every other provider in the file stops
 // resolving. Clearing it on startup keeps registration the single source.
-function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
-	rescuedKey = undefined;
-	rescueOutcome = undefined;
+async function purgeLegacyProvider(
+	providerID: string,
+	isOMP: boolean,
+	settleKey: (key: string, snapshotHolds: () => boolean) => Promise<boolean>,
+): Promise<string[]> {
+	keyMigrated = false;
+	keyBlocked = false;
 	yamlUnsupported = false;
 	const file = configPath(isOMP);
-	return purgeConfigFile(file, providerID, isOMP) ? [file] : [];
+	return (await purgeConfigFile(file, providerID, isOMP, settleKey)) ? [file] : [];
 }
 
 function registerTools(pi: ExtensionAPI) {
@@ -602,13 +623,24 @@ async function ompAuthStorage(pi: unknown): Promise<AuthStorageLike | undefined>
 	}
 }
 
-async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+// `read: false` means the store could not be consulted -- distinct from "there
+// is no credential". Conflating the two would let a transient read failure
+// overwrite a credential that is actually there.
+async function readStoredKey(
+	storage: AuthStorageLike | undefined,
+	providerID: string,
+): Promise<{ read: boolean; key?: string }> {
+	if (!storage?.peekApiKey) return { read: true };
 	try {
-		const key = await storage?.peekApiKey?.(providerID);
-		return typeof key === "string" && key.trim() ? key.trim() : undefined;
+		const key = await storage.peekApiKey(providerID);
+		return { read: true, key: typeof key === "string" && key.trim() ? key.trim() : undefined };
 	} catch {
-		return undefined;
+		return { read: false };
 	}
+}
+
+async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+	return (await readStoredKey(storage, providerID)).key;
 }
 
 async function storeKey(storage: AuthStorageLike | undefined, providerID: string, key: string): Promise<boolean> {
@@ -621,55 +653,114 @@ async function storeKey(storage: AuthStorageLike | undefined, providerID: string
 	}
 }
 
-type SessionContext = {
-	ui?: { notify?(message: string, type?: string): void };
-	modelRegistry?: unknown;
-};
+type SessionContext = { ui?: { notify?(message: string, type?: string): void } };
 
-// Move a rescued key into the host's credential store so it survives the
-// deletion. This is the Pi path -- Oh My Pi stores the key at load time,
-// before the catalog fetch that needs it.
-async function persistRescuedKey(providerID: string, ctx: SessionContext): Promise<boolean> {
-	const key = rescuedKey;
-	const registry = ctx.modelRegistry as
-		| { login?: (provider: string, type: string, interaction: unknown) => Promise<unknown> }
-		| undefined;
-	if (!key || typeof registry?.login !== "function") return false;
-	// The provider registers an oauth-shaped flow, but ask for the api_key form
-	// too: which one a host offers depends on how it composed the provider.
-	for (const type of ["oauth", "api_key"]) {
+// Pi's credential file. The registry it hands extensions exposes only readers
+// -- no login(), no setter of any kind -- so a key can be moved there only by
+// writing the file, the same way this extension already edits models.json.
+// These files hold API keys, so the temp file must never exist in a readable
+// mode: create it 0600 before writing (umask can only clear bits, never add
+// them), then move it to the destination's own mode. Removing any leftover
+// first matters -- writeFileSync does not apply `mode` to an existing file.
+function writeSecretFile(temp: string, data: string, mode: number): void {
+	rmSync(temp, { force: true });
+	writeFileSync(temp, data, { mode: 0o600 });
+	chmodSync(temp, mode);
+}
+
+// Dotfile managers link credential files too; renaming onto the link would
+// swap it for a regular file and the managed original would never see the key.
+// Undefined means the path cannot be written safely: a dangling link resolves
+// to nothing, and writing there would destroy the link a later sync expects.
+function resolveTarget(file: string): string | undefined {
+	try {
+		return realpathSync(file);
+	} catch {
 		try {
-			await registry.login(providerID, type, { prompt: async () => key, notify: () => {} });
-			rescuedKey = undefined;
-			rescueOutcome = "stored";
+			if (lstatSync(file).isSymbolicLink()) return undefined;
+		} catch {
+			// Nothing at that path: it is its own target.
+		}
+		return file;
+	}
+}
+
+function authPath(): string {
+	return join(dirname(configPath(false)), "auth.json");
+}
+
+function readAuthKey(providerID: string): string | undefined {
+	const file = authPath();
+	if (!existsSync(file)) return undefined;
+	try {
+		const parsed = JSON.parse(readFileSync(file, "utf-8")) as Record<string, CredentialLike | undefined>;
+		if (!parsed || typeof parsed !== "object" || !Object.hasOwn(parsed, providerID)) return undefined;
+		// Same shapes portalKey() accepts, so an oauth login counts as stored.
+		return portalCredentialKey(parsed[providerID]);
+	} catch {
+		return undefined;
+	}
+}
+
+function writeAuthKey(providerID: string, key: string): boolean {
+	const target = resolveTarget(authPath());
+	if (!target) return false;
+	const entry = { type: "api_key", key };
+
+	if (!existsSync(target)) {
+		// Exclusive create rather than check-then-rename: another process (a
+		// concurrent /login, say) may write auth.json while this one works, and
+		// replacing it would throw away every credential it just stored. "wx"
+		// fails instead, and the block is kept.
+		try {
+			const created: Record<string, unknown> = {};
+			Object.defineProperty(created, providerID, { value: entry, enumerable: true, writable: true, configurable: true });
+			writeFileSync(target, `${JSON.stringify(created, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 			return true;
 		} catch {
-			// Try the next credential type.
+			return false;
 		}
 	}
-	return false;
+
+	const temp = `${target}.llm2-tmp`;
+	try {
+		const text = readFileSync(target, "utf-8");
+		const parsed = JSON.parse(text) as Record<string, unknown>;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+		// An entry already exists but the caller could not read a usable key out
+		// of it -- an oauth shape this extension does not know, or a broken value.
+		// It is not ours to replace, and claiming success would let the caller
+		// delete the block holding the only readable key. Report failure so the
+		// block stays and the user is asked to sort the credential out.
+		if (Object.hasOwn(parsed, providerID)) return false;
+		// Plain assignment would hit the inherited __proto__ setter and store
+		// nothing, while still reporting success.
+		Object.defineProperty(parsed, providerID, { value: entry, enumerable: true, writable: true, configurable: true });
+		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, statSync(target).mode & 0o777);
+		if (readFileSync(target, "utf-8") !== text) {
+			rmSync(temp, { force: true });
+			return false;
+		}
+		renameSync(temp, target);
+		return true;
+	} catch {
+		rmSync(temp, { force: true });
+		return false;
+	}
 }
 
 async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
-	const key = await keyFromRegistry(ctx).catch(() => undefined);
-	if (key) {
-		// The host can already authenticate; the deleted block's key is redundant.
-		rescuedKey = undefined;
-		rescueOutcome = undefined;
-	} else if (rescueOutcome === "session") {
-		await persistRescuedKey(providerID, ctx);
-	}
-
 	const notes: string[] = [];
 	if (purged.length > 0) {
 		notes.push(
 			`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider，原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
 		);
+		if (keyMigrated) notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
 	}
-	if (rescueOutcome === "stored") {
-		notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
-	} else if (rescueOutcome === "session") {
-		notes.push(`其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`);
+	if (keyBlocked) {
+		notes.push(
+			`检测到本地遗留的 ${providerID} provider 配置，其中的 API Key 还没有存入凭据库，删除会导致它丢失，所以暂时保留。请运行 /login ${providerID} 保存后重启，扩展会自动清理这段配置。`,
+		);
 	}
 	if (yamlUnsupported) {
 		notes.push(
@@ -683,31 +774,49 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const isOMP = "pi" in (pi as unknown as Record<string, unknown>);
 	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
 	const providerName = env("LLM2_PROVIDER_NAME", DEFAULT_PROVIDER_NAME);
-	const purged = purgeLegacyProvider(providerID, isOMP);
+	// Resolve the host credential before anything else: on Oh My Pi this is the
+	// only chance to publish models early enough for --model to resolve, and the
+	// cleanup below must know whether a key it finds already has a home.
+	const storage = isOMP ? await ompAuthStorage(pi) : undefined;
+	let stored = isOMP ? await storedKey(storage, providerID) : readAuthKey(providerID);
 
-	// Read the host credential before building the provider config: on Oh My Pi
-	// this is the only chance to publish models early enough for --model to
-	// resolve, and it is where a rescued key has to land to survive the purge.
-	const storage = await ompAuthStorage(pi);
-	let stored = await storedKey(storage, providerID);
-	if (rescuedKey && stored) {
-		// The store can already authenticate; the deleted block's key is redundant.
-		rescuedKey = undefined;
-		rescueOutcome = undefined;
-	} else if (rescuedKey) {
-		const rescued = rescuedKey;
-		if (await storeKey(storage, providerID, rescued)) {
-			rescuedKey = undefined;
-			rescueOutcome = "stored";
-			// It lives in the store now, so it is the live credential for this
-			// load too -- the catalog fetch below still needs it.
-			stored = rescued;
+	const purged = await purgeLegacyProvider(providerID, isOMP, async (key, snapshotHolds) => {
+		// Already able to authenticate: the block's key is redundant, drop it.
+		if (stored) return true;
+		if (isOMP) {
+			// Re-read first: another process may have completed /login since the
+			// snapshot above, and overwriting a credential the user just entered
+			// with one from a legacy block would be worse than not migrating.
+			// A store that cannot be read is not a store known to be empty.
+			const current = await readStoredKey(storage, providerID);
+			if (!current.read) return false;
+			if (current.key) {
+				// Hand it to the catalog fetch below: that is the only discovery
+				// early enough for --model to resolve in this invocation.
+				stored = current.key;
+				return true;
+			}
 		}
-	}
-	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
-	// as an environment-variable name while Pi accepts interpolation syntax.
-	// A literal resolved value works in both clients and remains in process memory.
-	const apiKey = stored || portalKey();
+		// Last look at the config before the credential store is changed: a block
+		// rewritten since would make this key obsolete, and storing it anyway
+		// would make the next launch delete the replacement block as redundant.
+		if (!snapshotHolds()) return false;
+		const moved = isOMP ? await storeKey(storage, providerID, key) : writeAuthKey(providerID, key);
+		if (!moved) return false;
+		keyMigrated = true;
+		// It lives in the store now, so it is also the live credential for this
+		// load -- the catalog fetch below still needs one.
+		stored = key;
+		return true;
+	});
+	// Only used to fetch the catalog below -- deliberately not put into the
+	// provider config.
+	const catalogKey = stored || portalKey();
+	// A credential the host manages must stay live: baking it into the provider
+	// config as a literal would keep authenticating after /logout, since nothing
+	// can clear a value captured here. An explicit LLM2_API_KEY is different --
+	// it is static by nature and the user controls it.
+	const apiKey = process.env.LLM2_API_KEY?.trim() || undefined;
 
 	const providerConfig = {
 		name: providerName,
@@ -757,9 +866,9 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	// a second registration replaces the first, so re-registering without models
 	// would throw the catalog away and leave every llm2 model unresolvable.
 	let initialModels: ModelConfig[] | undefined;
-	if (isOMP && apiKey) {
+	if (isOMP && catalogKey) {
 		try {
-			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), apiKey)).models;
+			initialModels = (await fetchCatalog(AbortSignal.timeout(OMP_STARTUP_CATALOG_TIMEOUT_MS), catalogKey)).models;
 		} catch {
 			// Portal unreachable at startup: the host's cached catalog still applies.
 		}
