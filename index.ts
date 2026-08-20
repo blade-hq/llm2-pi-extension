@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -351,8 +351,15 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	// cleanup exists to prevent. Rename within a directory is atomic.
 	const temp = `${file}.llm2-tmp`;
 	try {
+		// These files hold API keys for every provider, and are commonly mode
+		// 0600. A fresh temp file would land on 0644 under the usual umask and
+		// the rename would publish the whole config to other local users, so
+		// carry the original mode over. chmod after the write: the `mode` option
+		// is masked by the umask, an explicit chmod is not.
+		const mode = statSync(file).mode & 0o777;
 		copyFileSync(file, `${file}${PURGE_BACKUP_SUFFIX}`);
 		writeFileSync(temp, purged.text);
+		chmodSync(temp, mode);
 		renameSync(temp, file);
 	} catch {
 		rmSync(temp, { force: true });

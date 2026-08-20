@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -229,7 +229,16 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(path, "utf-8")).toBe(content);
 	});
 
-	test("removes the llm2 block from models.json", async () =>{
+	test("preserves the original file mode", async () => {
+		// These files hold API keys; a 0600 config must not come back 0644.
+		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n");
+		chmodSync(path, 0o600);
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
+		expect(statSync(path).mode & 0o777).toBe(0o600);
+	});
+
+	test("removes the llm2 block from models.json", async () => {
 		const path = writeConfig(".pi", "models.json", JSON.stringify({
 			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },
 		}));
