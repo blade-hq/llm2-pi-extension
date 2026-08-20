@@ -5,6 +5,9 @@
   "keywords": ["pi-package", "omp-plugin"],
   "license": "UNLICENSED",
   "files": ["index.ts", "package.json"],
+  "engines": {
+    "bun": ">=1.3.14"
+  },
   "scripts": {
     "test": "bun test ./test.ts"
   },

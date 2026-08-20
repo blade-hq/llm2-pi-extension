@@ -59,6 +59,8 @@ let hostKey: string | undefined;
 let rescuedKey: string | undefined;
 // Whether that key made it into the host's credential store.
 let rescueStored = false;
+// The running client reads YAML but this runtime cannot parse it.
+let yamlUnsupported = false;
 
 function portalKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
@@ -236,11 +238,17 @@ function providersOf(parsed: ConfigShape | undefined): Providers | undefined {
 		: undefined;
 }
 
-// Bun powers both clients and ships a YAML parser. Without one this extension
-// will not edit YAML at all: a hand-rolled parse cannot be trusted to leave a
-// working file working, and a broken models.yml takes every provider down.
+// Oh My Pi runs on Bun (its own engines field requires >=1.3.14, which ships
+// Bun.YAML) and is the client that reads models.yml; Pi runs on Node and reads
+// models.json. Without a parser this extension will not edit YAML at all: a
+// hand-rolled parse cannot be trusted to leave a working file working, and a
+// broken models.yml takes every provider down with it.
+function yamlParser(): { parse(text: string): unknown } | undefined {
+	return (globalThis as { Bun?: { YAML?: { parse(text: string): unknown } } }).Bun?.YAML;
+}
+
 function parseYAML(text: string): ConfigShape | undefined {
-	const yaml = (globalThis as { Bun?: { YAML?: { parse(text: string): unknown } } }).Bun?.YAML;
+	const yaml = yamlParser();
 	if (!yaml) return undefined;
 	try {
 		const parsed = yaml.parse(text);
@@ -353,6 +361,12 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	} catch {
 		return false;
 	}
+	if (!file.endsWith(".json") && !yamlParser()) {
+		// Say so rather than skipping quietly, but only for the file this client
+		// actually reads: another client's models.yml is its own to clean up.
+		if (file === activeFile && text.includes(providerID)) yamlUnsupported = true;
+		return false;
+	}
 	const purged = file.endsWith(".json") ? purgeJSON(text, providerID) : purgeYAML(text, providerID);
 	if (purged === null) return false;
 	// Write a sibling and rename it into place: a direct write that fails
@@ -461,6 +475,7 @@ function resolveKeyReference(value: string, isOMP: boolean): string | undefined 
 function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
 	rescuedKey = undefined;
 	rescueStored = false;
+	yamlUnsupported = false;
 	const { active, sweep } = configPaths(isOMP);
 	return sweep.filter(file => purgeConfigFile(file, providerID, active, isOMP));
 }
@@ -600,6 +615,11 @@ async function onSessionStart(providerID: string, purged: string[], ctx: Session
 			rescueStored
 				? "其中的 API Key 已存入凭据库，无需重新登录。"
 				: `其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`,
+		);
+	}
+	if (yamlUnsupported) {
+		notes.push(
+			`本地配置里还有遗留的 ${providerID} provider 配置，但当前运行时没有 YAML 解析器（需要 Bun 1.3.14 及以上），无法安全清理，请升级后重启或手动删除该配置块。`,
 		);
 	}
 	if (notes.length > 0) ctx.ui?.notify?.(notes.join(""), "warning");
