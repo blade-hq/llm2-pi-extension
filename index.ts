@@ -411,7 +411,7 @@ async function purgeConfigFile(
 	file: string,
 	providerID: string,
 	isOMP: boolean,
-	settleKey: (key: string) => Promise<boolean>,
+	settleKey: (key: string, snapshotHolds: () => boolean) => Promise<boolean>,
 ): Promise<boolean> {
 	if (!existsSync(file)) return false;
 	let text: string;
@@ -447,8 +447,15 @@ async function purgeConfigFile(
 	// Settle the key before touching the file. The block may hold the only copy,
 	// and a client whose credential store cannot be written from here has no way
 	// to get it back -- so leave the block in place rather than delete it.
+	const snapshotHolds = () => {
+		try {
+			return readFileSync(target, "utf-8") === text;
+		} catch {
+			return false;
+		}
+	};
 	const key = purged.apiKey ? resolveKeyReference(purged.apiKey, isOMP) : undefined;
-	if (key && !(await settleKey(key))) {
+	if (key && !(await settleKey(key, snapshotHolds))) {
 		keyBlocked = true;
 		return false;
 	}
@@ -530,7 +537,7 @@ function resolveKeyReference(value: string, isOMP: boolean): string | undefined 
 async function purgeLegacyProvider(
 	providerID: string,
 	isOMP: boolean,
-	settleKey: (key: string) => Promise<boolean>,
+	settleKey: (key: string, snapshotHolds: () => boolean) => Promise<boolean>,
 ): Promise<string[]> {
 	keyMigrated = false;
 	keyBlocked = false;
@@ -611,13 +618,24 @@ async function ompAuthStorage(pi: unknown): Promise<AuthStorageLike | undefined>
 	}
 }
 
-async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+// `read: false` means the store could not be consulted -- distinct from "there
+// is no credential". Conflating the two would let a transient read failure
+// overwrite a credential that is actually there.
+async function readStoredKey(
+	storage: AuthStorageLike | undefined,
+	providerID: string,
+): Promise<{ read: boolean; key?: string }> {
+	if (!storage?.peekApiKey) return { read: true };
 	try {
-		const key = await storage?.peekApiKey?.(providerID);
-		return typeof key === "string" && key.trim() ? key.trim() : undefined;
+		const key = await storage.peekApiKey(providerID);
+		return { read: true, key: typeof key === "string" && key.trim() ? key.trim() : undefined };
 	} catch {
-		return undefined;
+		return { read: false };
 	}
+}
+
+async function storedKey(storage: AuthStorageLike | undefined, providerID: string): Promise<string | undefined> {
+	return (await readStoredKey(storage, providerID)).key;
 }
 
 async function storeKey(storage: AuthStorageLike | undefined, providerID: string, key: string): Promise<boolean> {
@@ -690,7 +708,9 @@ function writeAuthKey(providerID: string, key: string): boolean {
 		// replacing it would throw away every credential it just stored. "wx"
 		// fails instead, and the block is kept.
 		try {
-			writeFileSync(target, `${JSON.stringify({ [providerID]: entry }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+			const created: Record<string, unknown> = {};
+			Object.defineProperty(created, providerID, { value: entry, enumerable: true, writable: true, configurable: true });
+			writeFileSync(target, `${JSON.stringify(created, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 			return true;
 		} catch {
 			return false;
@@ -708,7 +728,9 @@ function writeAuthKey(providerID: string, key: string): boolean {
 		// delete the block holding the only readable key. Report failure so the
 		// block stays and the user is asked to sort the credential out.
 		if (Object.hasOwn(parsed, providerID)) return false;
-		parsed[providerID] = entry;
+		// Plain assignment would hit the inherited __proto__ setter and store
+		// nothing, while still reporting success.
+		Object.defineProperty(parsed, providerID, { value: entry, enumerable: true, writable: true, configurable: true });
 		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, statSync(target).mode & 0o777);
 		if (readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
@@ -753,15 +775,23 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	const storage = isOMP ? await ompAuthStorage(pi) : undefined;
 	let stored = isOMP ? await storedKey(storage, providerID) : readAuthKey(providerID);
 
-	const purged = await purgeLegacyProvider(providerID, isOMP, async key => {
+	const purged = await purgeLegacyProvider(providerID, isOMP, async (key, snapshotHolds) => {
 		// Already able to authenticate: the block's key is redundant, drop it.
 		if (stored) return true;
-		// Re-read first: another process may have completed /login since the
-		// snapshot above, and overwriting a credential the user just entered
-		// with one from a legacy block would be worse than not migrating.
-		const moved = isOMP
-			? (await storedKey(storage, providerID)) !== undefined || (await storeKey(storage, providerID, key))
-			: writeAuthKey(providerID, key);
+		if (isOMP) {
+			// Re-read first: another process may have completed /login since the
+			// snapshot above, and overwriting a credential the user just entered
+			// with one from a legacy block would be worse than not migrating.
+			// A store that cannot be read is not a store known to be empty.
+			const current = await readStoredKey(storage, providerID);
+			if (!current.read) return false;
+			if (current.key) return true;
+		}
+		// Last look at the config before the credential store is changed: a block
+		// rewritten since would make this key obsolete, and storing it anyway
+		// would make the next launch delete the replacement block as redundant.
+		if (!snapshotHolds()) return false;
+		const moved = isOMP ? await storeKey(storage, providerID, key) : writeAuthKey(providerID, key);
 		if (!moved) return false;
 		keyMigrated = true;
 		// It lives in the store now, so it is also the live credential for this

@@ -499,6 +499,35 @@ describe("api key handling", () => {
 		expect(sets).toEqual([]);
 	});
 
+	test("stores a __proto__ provider id as a real entry", async () => {
+		// Written as text: an object literal's __proto__ key sets the prototype.
+		writeConfig(".pi", "models.json", '{"providers":{"__proto__":{"apiKey":"sk-proto","models":[]}}}');
+		process.env.LLM2_PROVIDER_ID = "__proto__";
+		try {
+			await extension(piHarness().pi as never);
+			// Plain assignment would silently store nothing here.
+			expect(Object.hasOwn(readAuth(), "__proto__")).toBe(true);
+		} finally {
+			delete process.env.LLM2_PROVIDER_ID;
+		}
+	});
+
+	test("Oh My Pi keeps the block when the credential store cannot be read", async () => {
+		const content = "providers:\n  llm2:\n    apiKey: sk-from-block\n    models:\n";
+		const path = writeConfig(".omp", "models.yml", content);
+		const sets: string[] = [];
+		const harness = ompHarness({
+			discoverAuthStorage: async () => ({
+				peekApiKey: () => { throw new Error("store unavailable"); },
+				set: (_id: string, credential: { key: string }) => { sets.push(credential.key); },
+			}),
+		});
+		await extension(harness.pi as never);
+		// A store that cannot be read may well hold a credential already.
+		expect(sets).toEqual([]);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));
