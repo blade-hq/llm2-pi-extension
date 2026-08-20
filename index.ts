@@ -275,8 +275,13 @@ function removeYAMLBlock(text: string, providerID: string): string | null {
 	for (let i = root + 1; i < lines.length; i++) {
 		const line = lines[i];
 		if (isSkippable(line)) continue;
+		// Only a top-level key ends the providers mapping. Everything indented
+		// belongs to some provider -- including sequence items like `- id: x`,
+		// which match no key pattern; stopping at those would hide any provider
+		// listed after one that spells out its models.
+		if (!/^\s/.test(line)) break;
 		const entry = /^(\s+)([^\s:]+)\s*:/.exec(line);
-		if (!entry) break;
+		if (!entry) continue;
 		if (baseIndent === null) baseIndent = entry[1];
 		if (entry[1] !== baseIndent) continue;
 		if (unquote(entry[2]) === providerID) { start = i; break; }

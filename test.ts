@@ -151,6 +151,25 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toContain("llm2:");
 	});
 
+	test("finds llm2 after a provider that spells out its models", async () => {
+		const path = writeConfig(".omp", "models.yml", [
+			"providers:",
+			"  gpu22:",
+			"    baseUrl: http://y/v1",
+			"    models:",
+			"      - id: qwen3.5-122b-int4",
+			"        input:",
+			"          - text",
+			"  llm2:",
+			"    models:",
+			"",
+		].join("\n"));
+		await extension(piHarness().pi as never);
+		const after = readFileSync(path, "utf-8");
+		expect(after).not.toContain("llm2");
+		expect(after).toContain("qwen3.5-122b-int4");
+	});
+
 	test("keeps providers a mapping when llm2 was the only entry", async () => {
 		const path = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    baseUrl: https://llm2.yangl.com.cn/v1\n    models:\n");
 		await extension(piHarness().pi as never);
