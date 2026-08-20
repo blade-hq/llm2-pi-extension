@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -227,6 +227,24 @@ describe("stale provider config cleanup", () => {
 		const path = writeConfig(".pi", "models.json", content);
 		await extension(piHarness().pi as never);
 		expect(readFileSync(path, "utf-8")).toBe(content);
+	});
+
+	test("updates the symlink target instead of replacing the link", async () => {
+		// Dotfile managers link these paths; the link must survive.
+		const store = join(sandbox, "dotfiles");
+		mkdirSync(store, { recursive: true });
+		const real = join(store, "models.yml");
+		writeFileSync(real, "providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n");
+		const dir = join(sandbox, ".omp", "agent");
+		mkdirSync(dir, { recursive: true });
+		const link = join(dir, "models.yml");
+		symlinkSync(real, link);
+
+		await extension(piHarness().pi as never);
+
+		expect(lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(readFileSync(real, "utf-8")).not.toContain("llm2");
+		expect(readFileSync(`${real}.llm2-purged.bak`, "utf-8")).toContain("llm2");
 	});
 
 	test("preserves the original file mode", async () => {

@@ -1,4 +1,14 @@
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -349,18 +359,28 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string, i
 	// halfway -- a full disk right after the backup copy, most concretely --
 	// would leave the live config truncated, which is exactly the damage this
 	// cleanup exists to prevent. Rename within a directory is atomic.
-	const temp = `${file}.llm2-tmp`;
+	// Follow symlinks before replacing anything: dotfile managers commonly link
+	// these paths, and renaming onto the link would swap it for a regular file,
+	// silently breaking that setup while the managed original keeps the stale
+	// block -- which the next sync would restore.
+	let target = file;
+	try {
+		target = realpathSync(file);
+	} catch {
+		// Unreadable link: fall back to the path as given.
+	}
+	const temp = `${target}.llm2-tmp`;
 	try {
 		// These files hold API keys for every provider, and are commonly mode
 		// 0600. A fresh temp file would land on 0644 under the usual umask and
 		// the rename would publish the whole config to other local users, so
 		// carry the original mode over. chmod after the write: the `mode` option
 		// is masked by the umask, an explicit chmod is not.
-		const mode = statSync(file).mode & 0o777;
-		copyFileSync(file, `${file}${PURGE_BACKUP_SUFFIX}`);
+		const mode = statSync(target).mode & 0o777;
+		copyFileSync(target, `${target}${PURGE_BACKUP_SUFFIX}`);
 		writeFileSync(temp, purged.text);
 		chmodSync(temp, mode);
-		renameSync(temp, file);
+		renameSync(temp, target);
 	} catch {
 		rmSync(temp, { force: true });
 		return false;
