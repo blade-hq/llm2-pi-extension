@@ -119,10 +119,30 @@ describe("llm2 provider authentication", () => {
 });
 
 // Oh My Pi is the client that reads models.yml; Pi reads models.json.
-function ompHarness(namespace: Record<string, unknown> = {}) {
+// Without an explicit namespace it gets a working in-memory credential store,
+// since a client that cannot store a key will not delete a block holding one.
+function ompHarness(namespace?: Record<string, unknown>) {
 	const harness = piHarness();
-	(harness.pi as Record<string, unknown>).pi = namespace;
+	const store: Record<string, string> = {};
+	(harness.pi as Record<string, unknown>).pi = namespace ?? {
+		discoverAuthStorage: async () => ({
+			peekApiKey: (id: string) => store[id],
+			set: (id: string, credential: { key: string }) => { store[id] = credential.key; },
+		}),
+	};
 	return harness;
+}
+
+function authFile(): string {
+	return join(sandbox, ".pi", "agent", "auth.json");
+}
+
+function readAuth(): Record<string, { type?: string; key?: string }> {
+	try {
+		return JSON.parse(readFileSync(authFile(), "utf-8"));
+	} catch {
+		return {};
+	}
 }
 
 function writeConfig(client: ".omp" | ".pi", file: string, content: string, profile?: string): string {
@@ -366,22 +386,39 @@ describe("api key handling", () => {
 		expect(requests.at(-1)?.authorization).toBe("Bearer sk-rescued-omp");
 	});
 
-	test("Pi moves a rescued key into the credential store at session start", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
-		const logins: Array<{ provider: string; type: string; key: string }> = [];
+	test("Pi writes a rescued key into auth.json", async () => {
+		const path = writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
 		const harness = piHarness();
 		await extension(harness.pi as never);
+		expect(readAuth().llm2).toEqual({ type: "api_key", key: "sk-rescued-pi" });
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
 		const notes: string[] = [];
-		await harness.sessionStart({
-			ui: { notify: (message: string) => notes.push(message) },
-			modelRegistry: {
-				async login(provider: string, type: string, interaction: { prompt(): Promise<string> }) {
-					logins.push({ provider, type, key: await interaction.prompt() });
-				},
-			},
-		});
-		expect(logins).toEqual([{ provider: "llm2", type: "oauth", key: "sk-rescued-pi" }]);
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) } });
 		expect(notes.join("")).toContain("已存入凭据库");
+	});
+
+	test("Pi keeps the block when the key cannot be stored", async () => {
+		// auth.json is a directory here, so writing it fails: the block holds the
+		// only copy of the key and must survive.
+		mkdirSync(authFile(), { recursive: true });
+		const content = JSON.stringify({ providers: { llm2: { apiKey: "sk-only-copy", models: [] } } });
+		const path = writeConfig(".pi", "models.json", content);
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		const notes: string[] = [];
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) } });
+		expect(notes.join("")).toContain("/login");
+		rmSync(authFile(), { recursive: true, force: true });
+	});
+
+	test("Pi does not overwrite an existing auth.json entry", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));
+		const path = writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-new", models: [] } } }));
+		await extension(piHarness().pi as never);
+		expect(readAuth().llm2).toEqual({ type: "oauth", access: "existing" } as never);
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
 	});
 
 	test("Oh My Pi leaves Pi's config file untouched", async () => {
@@ -406,17 +443,8 @@ describe("api key handling", () => {
 		const ompPath = writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: sk-omp-key\n    models:\n");
 		const ompBefore = readFileSync(ompPath, "utf-8");
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-key", models: [] } } }));
-		const logins: Array<{ key: string }> = [];
-		const harness = piHarness();
-		await extension(harness.pi as never);
-		await harness.sessionStart({
-			modelRegistry: {
-				async login(_provider: string, _type: string, interaction: { prompt(): Promise<string> }) {
-					logins.push({ key: await interaction.prompt() });
-				},
-			},
-		});
-		expect(logins).toEqual([{ key: "sk-pi-key" }]);
+		await extension(piHarness().pi as never);
+		expect(readAuth().llm2?.key).toBe("sk-pi-key");
 		expect(readFileSync(ompPath, "utf-8")).toBe(ompBefore);
 	});
 
@@ -461,35 +489,21 @@ describe("api key handling", () => {
 	});
 
 	test("skips migration when the reference resolves to nothing", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "$LLM2_MISSING_VAR", models: [] } } }));
-		const logins: unknown[] = [];
-		const harness = piHarness();
-		await extension(harness.pi as never);
-		const notes: string[] = [];
-		await harness.sessionStart({
-			ui: { notify: (message: string) => notes.push(message) },
-			modelRegistry: { login: async (...args: unknown[]) => { logins.push(args); } },
-		});
-		expect(logins).toEqual([]);
-		expect(notes.join("")).not.toContain("API Key");
+		// Nothing usable to move, so the block stays put rather than losing it.
+		const content = JSON.stringify({ providers: { llm2: { apiKey: "$LLM2_MISSING_VAR", models: [] } } });
+		const path = writeConfig(".pi", "models.json", content);
+		await extension(piHarness().pi as never);
+		expect(readAuth().llm2).toBeUndefined();
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
 	});
 
 	test("Pi ignores OMP_PROFILE when locating its own config", async () => {
 		// Pi has no profile feature; OMP_PROFILE must not move its active path.
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-unprofiled", models: [] } } }));
-		const logins: Array<{ key: string }> = [];
 		process.env.OMP_PROFILE = "work";
 		try {
-			const harness = piHarness();
-			await extension(harness.pi as never);
-			await harness.sessionStart({
-				modelRegistry: {
-					async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
-						logins.push({ key: await interaction.prompt() });
-					},
-				},
-			});
-			expect(logins).toEqual([{ key: "sk-pi-unprofiled" }]);
+			await extension(piHarness().pi as never);
+			expect(readAuth().llm2?.key).toBe("sk-pi-unprofiled");
 		} finally {
 			delete process.env.OMP_PROFILE;
 		}
@@ -498,19 +512,10 @@ describe("api key handling", () => {
 	test("Pi ignores PI_CONFIG_DIR when locating its own config", async () => {
 		// PI_CONFIG_DIR is an Oh My Pi setting; Pi never reads it.
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-default-root", models: [] } } }));
-		const logins: Array<{ key: string }> = [];
 		process.env.PI_CONFIG_DIR = ".somewhere-else";
 		try {
-			const harness = piHarness();
-			await extension(harness.pi as never);
-			await harness.sessionStart({
-				modelRegistry: {
-					async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
-						logins.push({ key: await interaction.prompt() });
-					},
-				},
-			});
-			expect(logins).toEqual([{ key: "sk-pi-default-root" }]);
+			await extension(piHarness().pi as never);
+			expect(readAuth().llm2?.key).toBe("sk-pi-default-root");
 		} finally {
 			delete process.env.PI_CONFIG_DIR;
 		}
@@ -518,17 +523,8 @@ describe("api key handling", () => {
 
 	test("Pi keeps an uppercase literal key instead of treating it as a reference", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "ABC123", models: [] } } }));
-		const logins: Array<{ key: string }> = [];
-		const harness = piHarness();
-		await extension(harness.pi as never);
-		await harness.sessionStart({
-			modelRegistry: {
-				async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
-					logins.push({ key: await interaction.prompt() });
-				},
-			},
-		});
-		expect(logins).toEqual([{ key: "ABC123" }]);
+		await extension(piHarness().pi as never);
+		expect(readAuth().llm2?.key).toBe("ABC123");
 	});
 
 	test("Oh My Pi resolves a lowercase environment-variable name", async () => {
@@ -565,15 +561,16 @@ describe("api key handling", () => {
 	});
 
 	test("does not tell the user to log in when a stored key already works", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "api_key", key: "sk-already-stored" } }, null, 2));
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-redundant", models: [] } } }));
 		const harness = piHarness();
 		await extension(harness.pi as never);
 		const notes: string[] = [];
-		await harness.sessionStart({
-			ui: { notify: (message: string) => notes.push(message) },
-			modelRegistry: { getApiKeyForProvider: async () => "sk-already-stored" },
-		});
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) } });
 		expect(notes.join("")).not.toContain("/login");
+		// The stored key wins; the redundant one is dropped with the block.
+		expect(readAuth().llm2?.key).toBe("sk-already-stored");
 	});
 
 	test("stops authenticating once the registry no longer has a credential", async () => {
@@ -599,23 +596,6 @@ describe("api key handling", () => {
 		expect(registration.config.fetchDynamicModels()).rejects.toThrow("没有 Portal API Key");
 	});
 
-	test("keeps tools working with a key the credential store refused", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-only-copy", models: [] } } }));
-		const harness = piHarness();
-		await extension(harness.pi as never);
-		const notes: string[] = [];
-		// No login() on the registry: persistence is impossible, so the key stays
-		// in memory -- and the warning promises it works for this session.
-		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) }, modelRegistry: {} });
-		expect(notes.join("")).toContain("本次会话仍然可用");
-
-		const search = harness.tools.find(tool => tool.name === "blade_web_search") as {
-			execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ text: string }> }>;
-		};
-		await search.execute("call-1", { query: "x" }, undefined, undefined, { modelRegistry: {} });
-		expect(requests.at(-1)?.authorization).toBe("Bearer sk-only-copy");
-	});
-
 	test("purges nothing when the provider id names an inherited property", async () => {
 		const content = JSON.stringify({ providers: { litellm: { baseUrl: "http://x/v1" } } }, null, 2) + "\n";
 		const path = writeConfig(".pi", "models.json", content);
@@ -629,19 +609,6 @@ describe("api key handling", () => {
 		}
 	});
 
-	test("a rescued key is not re-stored when the host already has one", async () => {
-		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
-		const logins: unknown[] = [];
-		const harness = piHarness();
-		await extension(harness.pi as never);
-		await harness.sessionStart({
-			modelRegistry: {
-				getApiKeyForProvider: async () => "sk-already-stored",
-				login: async (...args: unknown[]) => { logins.push(args); },
-			},
-		});
-		expect(logins).toEqual([]);
-	});
 });
 
 afterAll(() => {
