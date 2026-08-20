@@ -599,6 +599,36 @@ describe("api key handling", () => {
 		expect(registration.config.fetchDynamicModels()).rejects.toThrow("没有 Portal API Key");
 	});
 
+	test("keeps tools working with a key the credential store refused", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-only-copy", models: [] } } }));
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const notes: string[] = [];
+		// No login() on the registry: persistence is impossible, so the key stays
+		// in memory -- and the warning promises it works for this session.
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) }, modelRegistry: {} });
+		expect(notes.join("")).toContain("本次会话仍然可用");
+
+		const search = harness.tools.find(tool => tool.name === "blade_web_search") as {
+			execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ text: string }> }>;
+		};
+		await search.execute("call-1", { query: "x" }, undefined, undefined, { modelRegistry: {} });
+		expect(requests.at(-1)?.authorization).toBe("Bearer sk-only-copy");
+	});
+
+	test("purges nothing when the provider id names an inherited property", async () => {
+		const content = JSON.stringify({ providers: { litellm: { baseUrl: "http://x/v1" } } }, null, 2) + "\n";
+		const path = writeConfig(".pi", "models.json", content);
+		process.env.LLM2_PROVIDER_ID = "toString";
+		try {
+			await extension(piHarness().pi as never);
+			expect(readFileSync(path, "utf-8")).toBe(content);
+			expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
+		} finally {
+			delete process.env.LLM2_PROVIDER_ID;
+		}
+	});
+
 	test("a rescued key is not re-stored when the host already has one", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
 		const logins: unknown[] = [];

@@ -50,10 +50,12 @@ function baseURL(): string {
 	return env("LLM2_BASE_URL", DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
-// An api key read out of a provider block just before it was deleted.
+// An api key read out of a provider block just before it was deleted, kept only
+// while it has nowhere else to live: once the host stores it, the host owns it.
 let rescuedKey: string | undefined;
-// Whether that key made it into the host's credential store.
-let rescueStored = false;
+// "stored" = handed to the credential store, "session" = held here because that
+// failed. Undefined means there was nothing worth rescuing.
+let rescueOutcome: "stored" | "session" | undefined;
 // The running client reads YAML but this runtime cannot parse it.
 let yamlUnsupported = false;
 
@@ -61,7 +63,8 @@ function portalKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
 	// No cached host key: a credential removed by /logout must stop working
-	// immediately, so callers resolve the live one themselves.
+	// immediately, so callers resolve the live one themselves. `rescuedKey` is
+	// not a host credential -- it only survives when the store refused it.
 	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
 }
 
@@ -161,10 +164,11 @@ async function keyFromRegistry(ctx: { modelRegistry?: unknown }): Promise<string
 async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
 	const key = await keyFromRegistry(ctx);
 	if (key) return key;
-	// With a context the registry is the live credential source. Falling back to
-	// a key cached from an earlier lookup would keep authenticating after
-	// /logout, so use only sources the host does not own.
-	return process.env.LLM2_API_KEY?.trim() || undefined;
+	// With a context the registry is the live credential source, so never fall
+	// back to something it handed over earlier -- that would outlive /logout.
+	// A rescued key is different: it is only still here because the store would
+	// not take it, so the tools would otherwise have no credential at all.
+	return process.env.LLM2_API_KEY?.trim() || rescuedKey;
 }
 
 async function portalRequest(
@@ -336,7 +340,7 @@ function removeYAMLBlock(text: string, providerID: string): string | null {
 function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	const before = parseYAML(text);
 	const providers = providersOf(before);
-	if (!providers || !(providerID in providers)) return null;
+	if (!providers || !Object.hasOwn(providers, providerID)) return null;
 
 	const edited = removeYAMLBlock(text, providerID);
 	if (edited === null) return null;
@@ -388,7 +392,7 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 		return null;
 	}
 	const providers = providersOf(parsed);
-	if (!providers || !(providerID in providers)) return null;
+	if (!providers || !Object.hasOwn(providers, providerID)) return null;
 	const apiKey = providers[providerID]?.apiKey;
 	delete providers[providerID];
 	// Re-serializing loses the original layout, so follow the file's own
@@ -455,7 +459,10 @@ function purgeConfigFile(file: string, providerID: string, isOMP: boolean): bool
 	// The deleted block may have been the only place the key lived. Keep it so
 	// the session stays usable and the key can be moved into the credential
 	// store once a context is available.
-	if (purged.apiKey) rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
+	if (purged.apiKey) {
+		rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
+		if (rescuedKey) rescueOutcome = "session";
+	}
 	return true;
 }
 
@@ -509,7 +516,7 @@ function resolveKeyReference(value: string, isOMP: boolean): string | undefined 
 // resolving. Clearing it on startup keeps registration the single source.
 function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
 	rescuedKey = undefined;
-	rescueStored = false;
+	rescueOutcome = undefined;
 	yamlUnsupported = false;
 	const file = configPath(isOMP);
 	return purgeConfigFile(file, providerID, isOMP) ? [file] : [];
@@ -625,6 +632,8 @@ async function persistRescuedKey(providerID: string, ctx: SessionContext): Promi
 	for (const type of ["oauth", "api_key"]) {
 		try {
 			await registry.login(providerID, type, { prompt: async () => key, notify: () => {} });
+			rescuedKey = undefined;
+			rescueOutcome = "stored";
 			return true;
 		} catch {
 			// Try the next credential type.
@@ -635,7 +644,13 @@ async function persistRescuedKey(providerID: string, ctx: SessionContext): Promi
 
 async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
 	const key = await keyFromRegistry(ctx).catch(() => undefined);
-	if (rescuedKey && !rescueStored && !key) rescueStored = await persistRescuedKey(providerID, ctx);
+	if (key) {
+		// The host can already authenticate; the deleted block's key is redundant.
+		rescuedKey = undefined;
+		rescueOutcome = undefined;
+	} else if (rescueOutcome === "session") {
+		await persistRescuedKey(providerID, ctx);
+	}
 
 	const notes: string[] = [];
 	if (purged.length > 0) {
@@ -643,12 +658,9 @@ async function onSessionStart(providerID: string, purged: string[], ctx: Session
 			`已删除本地遗留的 ${providerID} provider 配置（${purged.join("、")}），扩展会自己注册该 provider，原文件备份为同名 ${PURGE_BACKUP_SUFFIX} 文件。`,
 		);
 	}
-	if (rescuedKey && rescueStored) {
+	if (rescueOutcome === "stored") {
 		notes.push("其中的 API Key 已存入凭据库，无需重新登录。");
-	} else if (rescuedKey && !key) {
-		// Only warn when nothing else can authenticate. A stored key means the
-		// rescued one was deliberately not written -- saying it failed would push
-		// the user to overwrite a credential that already works.
+	} else if (rescueOutcome === "session") {
 		notes.push(`其中的 API Key 本次会话仍然可用，但没能写入凭据库，请运行 /login ${providerID} 永久保存。`);
 	}
 	if (yamlUnsupported) {
@@ -669,8 +681,21 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	// this is the only chance to publish models early enough for --model to
 	// resolve, and it is where a rescued key has to land to survive the purge.
 	const storage = await ompAuthStorage(pi);
-	const stored = await storedKey(storage, providerID);
-	if (rescuedKey && !stored) rescueStored = await storeKey(storage, providerID, rescuedKey);
+	let stored = await storedKey(storage, providerID);
+	if (rescuedKey && stored) {
+		// The store can already authenticate; the deleted block's key is redundant.
+		rescuedKey = undefined;
+		rescueOutcome = undefined;
+	} else if (rescuedKey) {
+		const rescued = rescuedKey;
+		if (await storeKey(storage, providerID, rescued)) {
+			rescuedKey = undefined;
+			rescueOutcome = "stored";
+			// It lives in the store now, so it is the live credential for this
+			// load too -- the catalog fetch below still needs it.
+			stored = rescued;
+		}
+	}
 	// Pass the resolved value rather than "$LLM2_API_KEY": OMP treats apiKey
 	// as an environment-variable name while Pi accepts interpolation syntax.
 	// A literal resolved value works in both clients and remains in process memory.
