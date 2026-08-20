@@ -673,10 +673,24 @@ function readAuthKey(providerID: string): string | undefined {
 function writeAuthKey(providerID: string, key: string): boolean {
 	const target = resolveTarget(authPath());
 	if (!target) return false;
+	const entry = { type: "api_key", key };
+
+	if (!existsSync(target)) {
+		// Exclusive create rather than check-then-rename: another process (a
+		// concurrent /login, say) may write auth.json while this one works, and
+		// replacing it would throw away every credential it just stored. "wx"
+		// fails instead, and the block is kept.
+		try {
+			writeFileSync(target, `${JSON.stringify({ [providerID]: entry }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	const temp = `${target}.llm2-tmp`;
 	try {
-		const existed = existsSync(target);
-		const text = existed ? readFileSync(target, "utf-8") : "{}";
+		const text = readFileSync(target, "utf-8");
 		const parsed = JSON.parse(text) as Record<string, unknown>;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
 		// An entry already exists but the caller could not read a usable key out
@@ -685,9 +699,9 @@ function writeAuthKey(providerID: string, key: string): boolean {
 		// delete the block holding the only readable key. Report failure so the
 		// block stays and the user is asked to sort the credential out.
 		if (parsed[providerID] !== undefined) return false;
-		parsed[providerID] = { type: "api_key", key };
-		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, existed ? statSync(target).mode & 0o777 : 0o600);
-		if (existed && readFileSync(target, "utf-8") !== text) {
+		parsed[providerID] = entry;
+		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, statSync(target).mode & 0o777);
+		if (readFileSync(target, "utf-8") !== text) {
 			rmSync(temp, { force: true });
 			return false;
 		}
