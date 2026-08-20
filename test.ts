@@ -33,12 +33,13 @@ const { default: extension } = await import("./index.ts");
 
 function piHarness() {
 	const registrations: unknown[] = [];
+	const tools: Array<Record<string, unknown>> = [];
 	const handlers: Record<string, Array<(event: unknown, ctx: unknown) => Promise<void>>> = {};
 	const pi = {
 		registerProvider(provider: unknown, config?: unknown) {
 			registrations.push(config === undefined ? provider : { provider, config });
 		},
-		registerTool() {},
+		registerTool(tool: Record<string, unknown>) { tools.push(tool); },
 		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
 			(handlers[event] ??= []).push(handler);
 		},
@@ -46,6 +47,7 @@ function piHarness() {
 	return {
 		pi,
 		registrations,
+		tools,
 		handlers,
 		sessionStart(ctx: unknown) { return Promise.all((handlers.session_start ?? []).map(h => h(null, ctx))); },
 		get registered() { return registrations.at(-1); },
@@ -572,6 +574,20 @@ describe("api key handling", () => {
 			modelRegistry: { getApiKeyForProvider: async () => "sk-already-stored" },
 		});
 		expect(notes.join("")).not.toContain("/login");
+	});
+
+	test("stops authenticating once the registry no longer has a credential", async () => {
+		// Simulates /logout while the client stays open: the key cached at load
+		// time must not keep tool calls authenticated.
+		const harness = ompHarness({ discoverAuthStorage: async () => ({ peekApiKey: () => "sk-stored" }) });
+		await extension(harness.pi as never);
+		const search = harness.tools.find(tool => tool.name === "blade_web_search") as {
+			execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ text: string }> }>;
+		};
+		const result = await search.execute("call-1", { query: "x" }, undefined, undefined, {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		});
+		expect(result.content[0]?.text).toContain("没有找到 Portal API Key");
 	});
 
 	test("a rescued key is not re-stored when the host already has one", async () => {

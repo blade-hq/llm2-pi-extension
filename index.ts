@@ -162,7 +162,12 @@ async function keyFromRegistry(ctx: { modelRegistry?: unknown }): Promise<string
 }
 
 async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
-	return (await keyFromRegistry(ctx)) ?? portalKey();
+	const key = await keyFromRegistry(ctx);
+	if (key) return key;
+	// With a context the registry is the live credential source. Falling back to
+	// a key cached from an earlier lookup would keep authenticating after
+	// /logout, so use only sources the host does not own.
+	return process.env.LLM2_API_KEY?.trim() || undefined;
 }
 
 async function portalRequest(
@@ -628,8 +633,10 @@ async function persistRescuedKey(providerID: string, ctx: SessionContext): Promi
 }
 
 async function onSessionStart(providerID: string, purged: string[], ctx: SessionContext) {
+	// Refresh unconditionally rather than only on a hit: a credential removed
+	// since the last session must not survive as a cached fallback.
 	const key = await keyFromRegistry(ctx).catch(() => undefined);
-	if (key) hostKey = key;
+	hostKey = key;
 	if (rescuedKey && !rescueStored && !key) rescueStored = await persistRescuedKey(providerID, ctx);
 
 	const notes: string[] = [];
