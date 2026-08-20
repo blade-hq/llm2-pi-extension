@@ -208,25 +208,42 @@ const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
 // never rewrites a file it does not need to touch.
 type PurgeResult = { text: string; apiKey?: string };
 
-// YAML keys and scalars may be quoted; compare and store the bare text.
+// YAML keys may be quoted; compare against the bare text.
 function unquote(value: string): string {
 	return value.replace(/^["']|["']$/g, "");
 }
 
-function yamlValue(line: string): string {
-	return unquote(line.slice(line.indexOf(":") + 1).trim());
+type ConfigShape = { providers?: Record<string, { apiKey?: unknown } | null> };
+
+// Bun powers both clients and ships a YAML parser. Without one this extension
+// will not edit YAML at all: a hand-rolled parse cannot be trusted to leave a
+// working file working, and a broken models.yml takes every provider down.
+function parseYAML(text: string): ConfigShape | undefined {
+	const yaml = (globalThis as { Bun?: { YAML?: { parse(text: string): unknown } } }).Bun?.YAML;
+	if (!yaml) return undefined;
+	try {
+		const parsed = yaml.parse(text);
+		return parsed && typeof parsed === "object" ? (parsed as ConfigShape) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
-function purgeYAML(text: string, providerID: string): PurgeResult | null {
+// Line-level edit so comments, indentation style and trailing whitespace in the
+// rest of the file survive. Bun.YAML.stringify() would round-trip the document
+// into one flow-style line, which is a worse outcome than a stale block.
+function removeYAMLBlock(text: string, providerID: string): string | null {
 	const lines = text.split("\n");
-	const root = lines.findIndex(line => /^providers\s*:\s*$/.test(line));
+	const root = lines.findIndex(line => /^["']?providers["']?\s*:\s*$/.test(line));
 	if (root < 0) return null;
+
+	const isSkippable = (line: string) => !line.trim() || line.trim().startsWith("#");
 
 	let start = -1;
 	let baseIndent: string | null = null;
 	for (let i = root + 1; i < lines.length; i++) {
 		const line = lines[i];
-		if (!line.trim() || line.trim().startsWith("#")) continue;
+		if (isSkippable(line)) continue;
 		const entry = /^(\s+)([^\s:]+)\s*:/.exec(line);
 		if (!entry) break;
 		if (baseIndent === null) baseIndent = entry[1];
@@ -237,12 +254,15 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 
 	let end = lines.length;
 	for (let i = start + 1; i < lines.length; i++) {
-		if (!lines[i].trim()) continue;
+		// Comments belong to the block, not to its end: treating an unindented
+		// comment as the terminator would delete only the first half of the
+		// block and leave its remaining properties dangling.
+		if (isSkippable(lines[i])) continue;
 		if ((/^\s*/.exec(lines[i]) as RegExpExecArray)[0].length <= baseIndent.length) { end = i; break; }
 	}
+	// Give trailing comments and blank lines back to whatever follows.
+	while (end > start + 1 && isSkippable(lines[end - 1])) end--;
 
-	const removed = lines.slice(start, end);
-	const apiKey = removed.find(line => /^\s+["']?apiKey["']?\s*:/.test(line));
 	const kept = [...lines.slice(0, start), ...lines.slice(end)];
 	// A bare `providers:` with no children parses as null and fails the same
 	// schema check this cleanup exists to prevent. Stop at the next top-level
@@ -250,7 +270,7 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	let survivor = false;
 	for (let i = root + 1; i < kept.length && !survivor; i++) {
 		const line = kept[i];
-		if (!line.trim() || line.trim().startsWith("#")) continue;
+		if (isSkippable(line)) continue;
 		if (!/^\s/.test(line)) break;
 		const entry = /^(\s+)[^\s:]+\s*:/.exec(line);
 		survivor = entry?.[1] === baseIndent;
@@ -258,9 +278,29 @@ function purgeYAML(text: string, providerID: string): PurgeResult | null {
 	if (!survivor) kept[root] = "providers: {}";
 	const result = kept.join("\n");
 	// Dropping a trailing block also drops the file's final newline.
+	return text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result;
+}
+
+// The parser decides what is there and what the edit must produce; the line
+// edit only supplies the formatting. Anything the edit cannot express exactly
+// -- an unrecognized spelling, a comment layout that shifts a boundary -- fails
+// this check and the file is left alone rather than rewritten into something
+// the client cannot load.
+function purgeYAML(text: string, providerID: string): PurgeResult | null {
+	const before = parseYAML(text);
+	if (!before?.providers || !(providerID in before.providers)) return null;
+
+	const edited = removeYAMLBlock(text, providerID);
+	if (edited === null) return null;
+
+	const expected = { ...before, providers: { ...before.providers } };
+	delete expected.providers[providerID];
+	if (JSON.stringify(parseYAML(edited)) !== JSON.stringify(expected)) return null;
+
+	const apiKey = before.providers[providerID]?.apiKey;
 	return {
-		text: text.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result,
-		apiKey: apiKey ? yamlValue(apiKey) || undefined : undefined,
+		text: edited,
+		apiKey: typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : undefined,
 	};
 }
 

@@ -170,6 +170,42 @@ describe("stale provider config cleanup", () => {
 		expect(readFileSync(path, "utf-8")).toBe("providers:\n  gpu22:\n    baseUrl: http://x/v1\n");
 	});
 
+	test("keeps a block intact when a comment sits at a shallower indent", async () => {
+		const path = writeConfig(".omp", "models.yml", [
+			"providers:",
+			"  llm2:",
+			"    baseUrl: https://x/v1",
+			"# an unindented comment inside the block",
+			"    models:",
+			"  gpu22:",
+			"    baseUrl: http://y/v1",
+			"",
+		].join("\n"));
+		await extension(piHarness().pi as never);
+		const after = readFileSync(path, "utf-8");
+		// The whole block must go; leaving `models:` behind would be invalid YAML.
+		expect(after).not.toContain("llm2");
+		expect(after).not.toContain("models:");
+		expect((Bun as never as { YAML: { parse(t: string): unknown } }).YAML.parse(after)).toEqual({
+			providers: { gpu22: { baseUrl: "http://y/v1" } },
+		});
+	});
+
+	test("removes the block under a quoted providers key", async () => {
+		const path = writeConfig(".omp", "models.yml", 'providers:\n  llm2:\n    models:\n  gpu22:\n    baseUrl: http://y/v1\n'.replace("providers:", '"providers":'));
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
+	});
+
+	test("leaves the file alone when the edit cannot be verified", async () => {
+		// Flow style: the parser sees llm2, the line edit cannot express the removal.
+		const content = "providers: {llm2: {models: null}, gpu22: {baseUrl: http://y/v1}}\n";
+		const path = writeConfig(".omp", "models.yml", content);
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		expect(() => readFileSync(`${path}.llm2-purged.bak`, "utf-8")).toThrow();
+	});
+
 	test("removes the llm2 block from models.json", async () => {
 		const path = writeConfig(".pi", "models.json", JSON.stringify({
 			providers: { llm2: { baseUrl: "https://llm2.yangl.com.cn/v1", models: [] }, litellm: { baseUrl: "http://x/v1" } },
