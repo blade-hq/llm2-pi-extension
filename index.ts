@@ -57,9 +57,15 @@ let keyBlocked = false;
 // The running client reads YAML but this runtime cannot parse it.
 let yamlUnsupported = false;
 
-function portalKey(credential?: CredentialLike): string | undefined {
+function portalCredentialKey(credential?: CredentialLike): string | undefined {
 	if (credential?.type === "oauth" && credential.access?.trim()) return credential.access.trim();
 	if (credential?.type === "api_key" && credential.key?.trim()) return credential.key.trim();
+	return undefined;
+}
+
+function portalKey(credential?: CredentialLike): string | undefined {
+	const fromCredential = portalCredentialKey(credential);
+	if (fromCredential) return fromCredential;
 	// No cached host key: a credential removed by /logout must stop working
 	// immediately, so callers resolve the live one themselves.
 	return process.env.LLM2_API_KEY?.trim() || undefined;
@@ -647,9 +653,9 @@ function readAuthKey(providerID: string): string | undefined {
 	const file = authPath();
 	if (!existsSync(file)) return undefined;
 	try {
-		const parsed = JSON.parse(readFileSync(file, "utf-8")) as Record<string, { type?: string; key?: string } | undefined>;
-		const entry = parsed?.[providerID];
-		return entry?.type === "api_key" && entry.key?.trim() ? entry.key.trim() : undefined;
+		const parsed = JSON.parse(readFileSync(file, "utf-8")) as Record<string, CredentialLike | undefined>;
+		// Same shapes portalKey() accepts, so an oauth login counts as stored.
+		return portalCredentialKey(parsed?.[providerID]);
 	} catch {
 		return undefined;
 	}
@@ -663,8 +669,12 @@ function writeAuthKey(providerID: string, key: string): boolean {
 		const text = existed ? readFileSync(target, "utf-8") : "{}";
 		const parsed = JSON.parse(text) as Record<string, unknown>;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-		// Never overwrite an entry the user already has, whatever its shape.
-		if (parsed[providerID] !== undefined) return true;
+		// An entry already exists but the caller could not read a usable key out
+		// of it -- an oauth shape this extension does not know, or a broken value.
+		// It is not ours to replace, and claiming success would let the caller
+		// delete the block holding the only readable key. Report failure so the
+		// block stays and the user is asked to sort the credential out.
+		if (parsed[providerID] !== undefined) return false;
 		parsed[providerID] = { type: "api_key", key };
 		writeSecretFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, existed ? statSync(target).mode & 0o777 : 0o600);
 		if (existed && readFileSync(target, "utf-8") !== text) {

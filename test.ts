@@ -429,6 +429,31 @@ describe("api key handling", () => {
 		expect(statSync(real).mode & 0o777).toBe(0o600);
 	});
 
+	test("keeps the block when the existing auth.json entry is unusable", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ llm2: null }, null, 2));
+		const content = JSON.stringify({ providers: { llm2: { apiKey: "sk-only-copy", models: [] } } });
+		const path = writeConfig(".pi", "models.json", content);
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		// Neither source may be lost: the entry is not ours to replace, so the
+		// block stays put.
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		expect(readAuth().llm2).toBeNull();
+		const notes: string[] = [];
+		await harness.sessionStart({ ui: { notify: (message: string) => notes.push(message) } });
+		expect(notes.join("")).toContain("/login");
+	});
+
+	test("treats an oauth entry as an existing credential", async () => {
+		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
+		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "tok", refresh: "tok" } }, null, 2));
+		const path = writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-redundant", models: [] } } }));
+		await extension(piHarness().pi as never);
+		expect(readFileSync(path, "utf-8")).not.toContain("llm2");
+		expect(readAuth().llm2).toEqual({ type: "oauth", access: "tok", refresh: "tok" } as never);
+	});
+
 	test("Pi does not overwrite an existing auth.json entry", async () => {
 		mkdirSync(join(sandbox, ".pi", "agent"), { recursive: true });
 		writeFileSync(authFile(), JSON.stringify({ llm2: { type: "oauth", access: "existing" } }, null, 2));
