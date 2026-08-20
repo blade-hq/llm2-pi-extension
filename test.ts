@@ -363,6 +363,42 @@ describe("api key handling", () => {
 		expect(notes.join("")).not.toContain("API Key");
 	});
 
+	test("Pi ignores OMP_PROFILE when locating its own config", async () => {
+		// Pi has no profile feature; OMP_PROFILE must not move its active path.
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-pi-unprofiled", models: [] } } }));
+		const logins: Array<{ key: string }> = [];
+		process.env.OMP_PROFILE = "work";
+		try {
+			const harness = piHarness();
+			await extension(harness.pi as never);
+			await harness.sessionStart({
+				modelRegistry: {
+					async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
+						logins.push({ key: await interaction.prompt() });
+					},
+				},
+			});
+			expect(logins).toEqual([{ key: "sk-pi-unprofiled" }]);
+		} finally {
+			delete process.env.OMP_PROFILE;
+		}
+	});
+
+	test("Pi keeps an uppercase literal key instead of treating it as a reference", async () => {
+		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "ABC123", models: [] } } }));
+		const logins: Array<{ key: string }> = [];
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		await harness.sessionStart({
+			modelRegistry: {
+				async login(_p: string, _t: string, interaction: { prompt(): Promise<string> }) {
+					logins.push({ key: await interaction.prompt() });
+				},
+			},
+		});
+		expect(logins).toEqual([{ key: "ABC123" }]);
+	});
+
 	test("a rescued key is not re-stored when the host already has one", async () => {
 		writeConfig(".pi", "models.json", JSON.stringify({ providers: { llm2: { apiKey: "sk-rescued-pi", models: [] } } }));
 		const logins: unknown[] = [];

@@ -322,7 +322,7 @@ function purgeJSON(text: string, providerID: string): PurgeResult | null {
 	};
 }
 
-function purgeConfigFile(file: string, providerID: string, activeFile: string): boolean {
+function purgeConfigFile(file: string, providerID: string, activeFile: string, isOMP: boolean): boolean {
 	if (!existsSync(file)) return false;
 	let text: string;
 	try {
@@ -341,7 +341,7 @@ function purgeConfigFile(file: string, providerID: string, activeFile: string): 
 	// The deleted block may have been the only place the key lived. Keep it so
 	// the session stays usable and the key can be moved into the credential
 	// store once a context is available.
-	if (purged.apiKey && file === activeFile) rescuedKey = resolveKeyReference(purged.apiKey);
+	if (purged.apiKey && file === activeFile) rescuedKey = resolveKeyReference(purged.apiKey, isOMP);
 	return true;
 }
 
@@ -359,7 +359,11 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 	// Bun caches os.homedir() at startup, so read $HOME first: it is what the
 	// host itself resolves to, and it keeps the cleanup testable.
 	const home = process.env.HOME?.trim() || homedir();
-	const profile = process.env.OMP_PROFILE?.trim() || process.env.PI_PROFILE?.trim();
+	// Profiles are an Oh My Pi feature -- Pi reads neither variable, so its
+	// active path must not shift because OMP_PROFILE happens to be exported.
+	// Oh My Pi's own rule is OMP_PROFILE when defined, otherwise PI_PROFILE.
+	const sweepProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim();
+	const profile = isOMP ? sweepProfile : undefined;
 	const configDir = process.env.PI_CONFIG_DIR?.trim() || (isOMP ? ".omp" : ".pi");
 	const override = process.env.PI_CODING_AGENT_DIR?.trim();
 	const profileSegments = profile ? ["profiles", profile] : [];
@@ -370,7 +374,9 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 	const dirs = new Set<string>([activeDir]);
 	for (const name of new Set([configDir, ".omp", ".pi"])) {
 		dirs.add(join(home, name, "agent"));
-		if (profile) dirs.add(join(home, name, "profiles", profile, "agent"));
+		// Sweep the profile variants regardless of client: deleting a stale block
+		// is safe anywhere, only the credential must come from `active`.
+		if (sweepProfile) dirs.add(join(home, name, "profiles", sweepProfile, "agent"));
 	}
 	const sweep = new Set<string>();
 	for (const dir of dirs) {
@@ -386,10 +392,12 @@ function configPaths(isOMP: boolean): { active: string; sweep: string[] } {
 // credential store, which only surfaces on a later launch without that variable
 // set -- after the working block is already gone. Resolve references, and skip
 // the migration when one resolves to nothing.
-function resolveKeyReference(value: string): string | undefined {
+function resolveKeyReference(value: string, isOMP: boolean): string | undefined {
 	const interpolated = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
 	if (interpolated) return process.env[interpolated[1]]?.trim() || undefined;
-	if (/^[A-Z][A-Z0-9_]*$/.test(value)) return process.env[value]?.trim() || undefined;
+	// The bare-name form is Oh My Pi's alone. In Pi the same spelling is a
+	// literal key, and treating it as a reference would discard a usable one.
+	if (isOMP && /^[A-Z][A-Z0-9_]*$/.test(value)) return process.env[value]?.trim() || undefined;
 	return value;
 }
 
@@ -401,7 +409,7 @@ function purgeLegacyProvider(providerID: string, isOMP: boolean): string[] {
 	rescuedKey = undefined;
 	rescueStored = false;
 	const { active, sweep } = configPaths(isOMP);
-	return sweep.filter(file => purgeConfigFile(file, providerID, active));
+	return sweep.filter(file => purgeConfigFile(file, providerID, active, isOMP));
 }
 
 function registerTools(pi: ExtensionAPI) {
