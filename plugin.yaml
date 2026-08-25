@@ -5,6 +5,6 @@ homepage: https://github.com/blade-hq/llm2-pi-extension
 kind: backend
 requires_env:
   - name: LLM2_API_KEY
-    description: Paste your BladeAI Portal key here (it starts with sk-llm2-; input is hidden)
+description: 请粘贴 BladeAI Portal Key（以 sk-llm2- 开头，输入内容会隐藏）
     url: https://llm2.yangl.com.cn
     secret: true

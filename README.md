@@ -1,105 +1,45 @@
-# BladeAI LLM2 extension for Pi, Oh My Pi, and Hermes Agent
+# BladeAI LLM2：Pi、Oh My Pi 与 Hermes Agent 扩展
 
-This repository contains client integrations for Pi, Oh My Pi, and Nous Research Hermes Agent.
+本仓库提供 BladeAI LLM2 的客户端扩展，支持官方 Pi、Oh My Pi，以及 Nous
+Research Hermes Agent。Portal 后端保持私有；这里的代码只在用户自己的客户端
+进程中运行，安装前可以自行检查源码。
 
-The extension registers:
+## 安装
 
-- the `llm2` Provider with a Portal-backed model catalog;
-- `blade_web_search`;
-- `blade_generate_image`.
-
-Hermes additionally gets the native `llm2` model, web-search, and image-gen providers.
-
-The Portal backend stays private. This repository contains only the code that runs in the user's Pi or Oh My Pi process. Because client extensions execute locally, users can inspect the source before installing it.
-
-## Install
-
-Install a fixed Git tag:
+Pi / Oh My Pi：
 
 ```bash
 pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
 omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
+```
+
+Hermes Agent：
+
+```bash
 hermes plugins install blade-hq/llm2-pi-extension --enable
 ```
 
-The same source works with both clients. The package manifest declares both `pi.extensions` and `omp.extensions`.
-Hermes discovers the root `plugin.yaml` and `__init__.py`; the TypeScript entrypoint remains unchanged.
+Hermes 安装时会显示隐藏输入框，提示“请粘贴 BladeAI Portal Key（以
+`sk-llm2-` 开头）”。直接粘贴 Key 并回车即可，Hermes 会自动保存；普通用户
+不需要理解或手动设置环境变量。若跳过了提示，可运行 `hermes config` 再填写。
 
-## Configure the Portal Key
+## 配置与使用
 
-Set the key in the shell:
-
-```bash
-export LLM2_API_KEY=sk-llm2-...
-```
-
-Or install the extension and run this command inside Pi or Oh My Pi:
+Pi / Oh My Pi 可以设置 `LLM2_API_KEY`，或在客户端执行：
 
 ```text
 /login llm2
 ```
 
-普通用户不需要理解“环境变量”。安装时 Hermes 会直接显示隐藏输入框，提示
-“Paste your BladeAI Portal key here”，输入 Portal Key 后回车即可；Hermes
-会自动保存它，之后不需要重复输入。Hermes' plugin API does not expose Pi's
-`/login` command or a credential-writer hook，因此这是 Hermes 的一次性配置路径：
-
-```bash
-hermes --provider llm2 -m <model-id>
-```
-
-如果安装时跳过了提示，可运行 `hermes config`，在 BladeAI LLM2 的配置项中
-填写同一个 key。高级用户也可以通过 `LLM2_API_KEY` 和可选的
-`LLM2_BASE_URL` 环境变量覆盖 Hermes 保存的值。
-
-The key is sent to the BladeAI Portal for model catalog access and model requests. It is not sent to the upstream catalog provider.
-
-Pi stores the key in `~/.pi/agent/auth.json`; Oh My Pi stores it in its credential database. Model refresh reads the credential through each client's supported auth path, so users do not need to export `LLM2_API_KEY` after `/login llm2`.
-
-## Stale provider blocks
-
-A hand-written `providers.llm2` block in `~/.pi/agent/models.json` or
-`~/.omp/agent/models.yml` shadows the provider this extension registers. A block
-that is missing its `models` array also fails schema validation, and the client
-then discards the whole config file, so every other provider in it stops
-resolving too.
-
-The extension deletes such a block on startup and backs the original file up as
-`<file>.llm2-purged.bak`. If the block carried an `apiKey`, that key is first
-moved into the client's credential store — Oh My Pi's store for `omp`,
-`auth.json` for Pi — so no re-login is needed.
-
-If that key cannot be stored, the block is **left in place**: it may hold the
-only copy, and deleting it would lose the credential. The extension then asks
-you to run `/login llm2`; the block is cleaned up on the next launch.
-
-Each client only ever touches the config file it reads itself. Cleaning up the
-other client's file from here would delete a block that may hold the only copy
-of its key, which cannot be migrated across clients -- so Pi fixes Pi and Oh My
-Pi fixes Oh My Pi, each on its own next launch.
-
-## Use
-
-After the Portal administrator enables the Provider and configures the model catalog, select a model such as:
+选择模型：
 
 ```bash
 pi --model llm2/<model-id>
 omp --model llm2/<model-id>
+hermes --provider llm2 -m <model-id>
 ```
 
-The extension refreshes models through the Portal endpoint:
-
-```text
-GET https://llm2.yangl.com.cn/pi/catalog
-Authorization: Bearer <your Portal key>
-```
-
-Tools:
-
-- `blade_web_search` calls the Portal web-search endpoint.
-- `blade_generate_image` calls the Portal image-generation endpoint.
-
-For Hermes, select the native backends in `config.yaml` (or `hermes tools`):
+Hermes 中可在 `hermes tools` 里选择后端，也可以在 `config.yaml` 写入：
 
 ```yaml
 web:
@@ -108,33 +48,36 @@ image_gen:
   provider: llm2
 ```
 
-BladeAI search returns one result containing the Portal's model-written
-`answer`, not a raw SERP list, and does not support extraction. Image generation
-is text-only with `gpt-image-2` / `gpt-image-1.5`; aspect ratios map to Portal sizes.
-Generated URLs are downloaded into Hermes' managed image cache before the local
-path is returned, so downstream tools do not need to fetch an expiring Portal URL.
+高级用户可以用 `LLM2_API_KEY` 覆盖已保存的 Key，用 `LLM2_BASE_URL` 覆盖默认
+地址 `https://llm2.yangl.com.cn/v1`。
 
-## Security
+## 能力说明
 
-This extension has the same local process permissions as Pi or Oh My Pi. Read the source and check the tag before installing or upgrading. Do not put a Portal key in the repository URL, source code, or issue reports.
+- `llm2` 模型提供商：通过 Portal 的 OpenAI 兼容 Chat Completions 接口工作。
+- Hermes 网络搜索：调用 `/v1/web-search`，返回 BladeAI 整理后的最终 `answer`，封装为一条结果；不是原始 SERP 列表，也不支持网页抽取。
+- Hermes 图片生成：调用 `/v1/images/generations`，支持 `gpt-image-2`、`gpt-image-1.5`。生成图片会自动下载到 Hermes 的图片缓存，避免下游再次下载临时 URL；当前只支持文生图。
+- Pi / Oh My Pi 仍提供原有的 `blade_web_search` 和 `blade_generate_image` 工具。
 
-## Development
+模型目录来自：
+
+```text
+GET https://llm2.yangl.com.cn/pi/catalog
+Authorization: Bearer <Portal Key>
+```
+
+## 安全提示
+
+扩展与 Pi、Oh My Pi、Hermes 进程拥有相同的本地权限。安装或升级前请检查源码，
+正式使用建议固定可信 tag 或 commit。不要把 Portal Key 写入仓库、URL、测试
+fixture 或 issue。
+
+## 开发与测试
 
 ```bash
 bun test ./test.ts
 python3 -m unittest test_hermes.py
 ```
 
-The extension registers its provider and tools through the public APIs. Beyond
-that it touches two pieces of client state, both described above:
-
-- **Config files.** It reads `models.json` / `models.yml`, and deletes a stale
-  `providers.llm2` block from them, backing the original up first. In YAML the
-  rest of the file is left byte-for-byte intact. JSON is re-serialized, keeping
-  key order and the file's own indentation; a file whose numbers exceed what
-  JSON round-trips exactly is left untouched instead.
-- **Credential store.** It reads the stored `llm2` key so model discovery works
-  after `/login`, and writes one back only when rescuing a key from a block it
-  is about to delete. On Pi that means `auth.json`, written directly: the
-  registry Pi exposes to extensions has readers only, no way to store a
-  credential. An existing entry is never overwritten.
+Hermes 插件位于根目录的 `plugin.yaml` 和 `__init__.py`；Pi / Oh My Pi 仍从
+`package.json` 的 `pi.extensions` / `omp.extensions` 加载 `index.ts`，两套入口
+互不影响。

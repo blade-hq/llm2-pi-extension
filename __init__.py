@@ -60,7 +60,7 @@ llm2 = ProviderProfile(
     name="llm2",
     aliases=("bladeai", "blade"),
     display_name="BladeAI LLM2",
-    description="OpenAI-compatible BladeAI Portal",
+    description="BladeAI Portal 兼容 OpenAI 接口",
     signup_url="https://llm2.yangl.com.cn",
     base_url=DEFAULT_BASE_URL,
     auth_type="api_key",
@@ -78,7 +78,7 @@ class LLM2WebSearchProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "BladeAI LLM2 Search"
+        return "BladeAI LLM2 网络搜索"
 
     def is_available(self) -> bool:
         return bool(_key())
@@ -112,7 +112,7 @@ class LLM2ImageGenProvider(ImageGenProvider):
 
     @property
     def display_name(self) -> str:
-        return "BladeAI LLM2 Images"
+        return "BladeAI LLM2 图片生成"
 
     def is_available(self) -> bool:
         return bool(_key())
@@ -127,10 +127,10 @@ class LLM2ImageGenProvider(ImageGenProvider):
         return {
             "name": self.display_name,
             "badge": "paid",
-            "tag": "BladeAI Portal image generation",
+            "tag": "通过 BladeAI Portal 生成图片",
             "env_vars": [{
                 "key": "LLM2_API_KEY",
-                "prompt": "BladeAI Portal API key (starts with sk-llm2-)",
+                "prompt": "BladeAI Portal Key（以 sk-llm2- 开头）",
                 "url": "https://llm2.yangl.com.cn",
             }],
         }
