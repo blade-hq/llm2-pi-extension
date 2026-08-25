@@ -39,16 +39,18 @@ Or install the extension and run this command inside Pi or Oh My Pi:
 /login llm2
 ```
 
-Hermes uses environment variables. Hermes' plugin API does not expose Pi's
-`/login` command or a credential-writer hook, so the installer prompts for
-`LLM2_API_KEY` from `plugin.yaml` and stores it in Hermes' managed `.env`.
-This is the one-time setup path for Hermes:
+普通用户不需要理解“环境变量”。安装时 Hermes 会直接显示隐藏输入框，提示
+“Paste your BladeAI Portal key here”，输入 Portal Key 后回车即可；Hermes
+会自动保存它，之后不需要重复输入。Hermes' plugin API does not expose Pi's
+`/login` command or a credential-writer hook，因此这是 Hermes 的一次性配置路径：
 
 ```bash
-export LLM2_API_KEY=sk-llm2-...
-export LLM2_BASE_URL=https://llm2.yangl.com.cn/v1  # optional
 hermes --provider llm2 -m <model-id>
 ```
+
+如果安装时跳过了提示，可运行 `hermes config`，在 BladeAI LLM2 的配置项中
+填写同一个 key。高级用户也可以通过 `LLM2_API_KEY` 和可选的
+`LLM2_BASE_URL` 环境变量覆盖 Hermes 保存的值。
 
 The key is sent to the BladeAI Portal for model catalog access and model requests. It is not sent to the upstream catalog provider.
 
