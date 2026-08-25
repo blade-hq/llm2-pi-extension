@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 from providers import register_provider
 from providers.base import ProviderProfile
 from agent.web_search_provider import WebSearchProvider
-from agent.image_gen_provider import ImageGenProvider, error_response, success_response
+from agent.image_gen_provider import ImageGenProvider, error_response, save_url_image, success_response
 
 DEFAULT_BASE_URL = "https://llm2.yangl.com.cn/v1"
 
@@ -123,6 +123,18 @@ class LLM2ImageGenProvider(ImageGenProvider):
     def capabilities(self) -> Dict[str, Any]:
         return {"modalities": ["text"], "max_reference_images": 0}
 
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return {
+            "name": self.display_name,
+            "badge": "paid",
+            "tag": "BladeAI Portal image generation",
+            "env_vars": [{
+                "key": "LLM2_API_KEY",
+                "prompt": "BladeAI Portal API key (starts with sk-llm2-)",
+                "url": "https://llm2.yangl.com.cn",
+            }],
+        }
+
     def generate(self, prompt: str, aspect_ratio: str = "landscape", **kwargs: Any) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         model = kwargs.get("model") or "gpt-image-2"
@@ -138,7 +150,19 @@ class LLM2ImageGenProvider(ImageGenProvider):
             url = items[0].get("url") if isinstance(items, list) and items and isinstance(items[0], dict) else None
             if not isinstance(url, str) or not url:
                 return error_response(error="Portal response did not contain an image URL", error_type="provider_error", provider=self.name, model=model, prompt=prompt, aspect_ratio=aspect_ratio)
-            return success_response(image=url, model=model, prompt=prompt, aspect_ratio=aspect_ratio, provider=self.name)
+            # Portal image URLs may be short-lived. Materialise them through
+            # Hermes' official image cache so downstream tools do not need to
+            # fetch the URL again. Keep the URL as a fallback for unusual
+            # Hermes installations where the optional downloader is absent.
+            try:
+                local_image = save_url_image(url, prefix="llm2")
+                image = str(local_image)
+            except Exception:
+                image = url
+            response = {"image": image, "model": model, "prompt": prompt, "aspect_ratio": aspect_ratio, "provider": self.name}
+            if image != url:
+                response["extra"] = {"source_url": url}
+            return success_response(**response)
         except Exception as exc:
             return error_response(error=str(exc), error_type="provider_error", provider=self.name, model=model, prompt=prompt, aspect_ratio=aspect_ratio)
 
@@ -146,4 +170,3 @@ class LLM2ImageGenProvider(ImageGenProvider):
 def register(ctx: Any) -> None:
     ctx.register_web_search_provider(LLM2WebSearchProvider())
     ctx.register_image_gen_provider(LLM2ImageGenProvider())
-

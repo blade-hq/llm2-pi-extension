@@ -39,7 +39,10 @@ Or install the extension and run this command inside Pi or Oh My Pi:
 /login llm2
 ```
 
-Hermes uses environment variables (it has no `/login` flow for this plugin):
+Hermes uses environment variables. Hermes' plugin API does not expose Pi's
+`/login` command or a credential-writer hook, so the installer prompts for
+`LLM2_API_KEY` from `plugin.yaml` and stores it in Hermes' managed `.env`.
+This is the one-time setup path for Hermes:
 
 ```bash
 export LLM2_API_KEY=sk-llm2-...
@@ -106,6 +109,8 @@ image_gen:
 BladeAI search returns one result containing the Portal's model-written
 `answer`, not a raw SERP list, and does not support extraction. Image generation
 is text-only with `gpt-image-2` / `gpt-image-1.5`; aspect ratios map to Portal sizes.
+Generated URLs are downloaded into Hermes' managed image cache before the local
+path is returned, so downstream tools do not need to fetch an expiring Portal URL.
 
 ## Security
 

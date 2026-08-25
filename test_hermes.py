@@ -32,6 +32,7 @@ def _load_plugin():
         pass
 
     image.ImageGenProvider = ImageGenProvider
+    image.save_url_image = lambda url, **kwargs: "/tmp/hermes-llm2.png"
     image.success_response = lambda **kwargs: {"success": True, **kwargs}
     image.error_response = lambda **kwargs: {"success": False, **kwargs}
     agent = types.ModuleType("agent")
@@ -97,7 +98,8 @@ class HermesPluginTests(unittest.TestCase):
         with patch.object(self.plugin, "urlopen", return_value=FakeResponse({"data": [{"url": "https://img.test/a.png"}]})) as opened:
             result = self.plugin.LLM2ImageGenProvider().generate("cat", aspect_ratio="square", model="gpt-image-1.5", quality="high")
         self.assertTrue(result["success"])
-        self.assertEqual(result["image"], "https://img.test/a.png")
+        self.assertEqual(result["image"], "/tmp/hermes-llm2.png")
+        self.assertEqual(result["extra"]["source_url"], "https://img.test/a.png")
         request = opened.call_args.args[0]
         self.assertEqual(request.headers["X-app-name"], "hermes-llm2-image")
         body = json.loads(request.data)
