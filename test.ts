@@ -685,7 +685,7 @@ describe("api key handling", () => {
 	test("Oh My Pi resolves a lowercase environment-variable name", async () => {
 		writeConfig(".omp", "models.yml", "providers:\n  llm2:\n    apiKey: llm2_portal_token\n    models:\n");
 		const stored: Array<{ key: string }> = [];
-		process.env.llm2_portal_token = "sk-from-lowercase-env";
+		process.env.llm2_portal_token = "from-env-key";
 		try {
 			const harness = piHarness();
 			(harness.pi as Record<string, unknown>).pi = {
@@ -695,7 +695,7 @@ describe("api key handling", () => {
 				}),
 			};
 			await extension(harness.pi as never);
-			expect(stored).toEqual([{ key: "sk-from-lowercase-env" }]);
+			expect(stored).toEqual([{ key: "from-env-key" }]);
 		} finally {
 			delete process.env.llm2_portal_token;
 		}
