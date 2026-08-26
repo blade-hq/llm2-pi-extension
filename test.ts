@@ -12,21 +12,24 @@ for (const key of ["PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PR
 
 const requests: Array<{ url: string; authorization: string | null }> = [];
 const originalFetch = globalThis.fetch;
+const defaultCatalogModels: Array<Record<string, unknown>> = [{
+	id: "test-model",
+	name: "Test Model",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 128000,
+	maxTokens: 16384,
+}];
+let catalogModels = defaultCatalogModels;
 
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 	const headers = new Headers(init?.headers);
 	requests.push({ url: String(input), authorization: headers.get("authorization") });
-	return new Response(JSON.stringify({
-		models: [{
-			id: "test-model",
-			name: "Test Model",
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128000,
-			maxTokens: 16384,
-		}],
-	}), { status: 200, headers: { "content-type": "application/json" } });
+	return new Response(JSON.stringify({ models: catalogModels }), {
+		status: 200,
+		headers: { "content-type": "application/json" },
+	});
 }) as typeof fetch;
 
 const { default: extension } = await import("./index.ts");
@@ -52,6 +55,20 @@ function piHarness() {
 		sessionStart(ctx: unknown) { return Promise.all((handlers.session_start ?? []).map(h => h(null, ctx))); },
 		get registered() { return registrations.at(-1); },
 	};
+}
+
+async function refresh(models: Array<Record<string, unknown>>) {
+	catalogModels = models;
+	try {
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const registration = harness.registered as {
+			config: { refreshModels(context: { credential?: { type: "api_key"; key: string } }): Promise<Array<{ id: string; reasoning: boolean }>> };
+		};
+		return await registration.config.refreshModels({ credential: { type: "api_key", key: "stored-pi-key" } });
+	} finally {
+		catalogModels = defaultCatalogModels;
+	}
 }
 
 describe("llm2 provider authentication", () => {
@@ -115,6 +132,67 @@ describe("llm2 provider authentication", () => {
 		const models = await registration.config.fetchDynamicModels("stored-omp-key");
 		expect(models.map(model => model.id)).toEqual(["test-model"]);
 		expect(requests.at(-1)?.authorization).toBe("Bearer stored-omp-key");
+	});
+});
+
+describe("catalog reasoning fallback", () => {
+	test("enables reasoning variants but not base Grok 3 models", async () => {
+		const models = await refresh([
+			{ id: "grok-3", reasoning: false },
+			{ id: "grok-3-beta", reasoning: false },
+			{ id: "grok-3-mini", reasoning: false },
+			{ id: "grok-3-reasoning", reasoning: false },
+			{ id: "grok-4.6", reasoning: false },
+		]);
+		expect(Object.fromEntries(models.map(model => [model.id, model.reasoning]))).toEqual({
+			"grok-3": false,
+			"grok-3-beta": false,
+			"grok-3-mini": true,
+			"grok-3-reasoning": true,
+			"grok-4.6": true,
+		});
+	});
+
+	test("keeps explicit non-reasoning and media models disabled", async () => {
+		const models = await refresh([
+			{ id: "grok-3-mini-non-reasoning", reasoning: false },
+			{ id: "grok-4.20-0309-reasoning", reasoning: false },
+			{ id: "gpt-image-1.5", reasoning: false },
+			{ id: "grok-imagine-video", reasoning: false },
+			{ id: "gpt-5.4", reasoning: false },
+		]);
+		expect(Object.fromEntries(models.map(model => [model.id, model.reasoning]))).toEqual({
+			"grok-3-mini-non-reasoning": false,
+			"grok-4.20-0309-reasoning": true,
+			"gpt-image-1.5": false,
+			"grok-imagine-video": false,
+			"gpt-5.4": true,
+		});
+	});
+
+	test("trusts an explicit catalog reasoning:true", async () => {
+		const models = await refresh([{ id: "custom-thinker", reasoning: true }]);
+		expect(models[0]?.reasoning).toBe(true);
+	});
+
+	test("does not enable GPT-5 chat variants", async () => {
+		const models = await refresh([
+			{ id: "gpt-5-chat-latest", reasoning: false },
+			{ id: "gpt-5.1-chat-latest", reasoning: false },
+			{ id: "gpt-5.4", reasoning: false },
+			{ id: "gpt-5-codex", reasoning: false },
+		]);
+		expect(Object.fromEntries(models.map(model => [model.id, model.reasoning]))).toEqual({
+			"gpt-5-chat-latest": false,
+			"gpt-5.1-chat-latest": false,
+			"gpt-5.4": true,
+			"gpt-5-codex": true,
+		});
+	});
+
+	test("restores the default catalog fixture after refresh", async () => {
+		await refresh([{ id: "custom-thinker", reasoning: true }]);
+		expect(catalogModels).toBe(defaultCatalogModels);
 	});
 });
 

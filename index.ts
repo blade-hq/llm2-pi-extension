@@ -80,6 +80,25 @@ function numberValue(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+// Portal's OpenAI-format catalog currently ships every model as reasoning:false,
+// including grok-4.6 and grok-4.20-*-reasoning. Trust an explicit true; otherwise
+// recover thinking support from the model id so omp can cycle thinking levels.
+function inferReasoning(id: string): boolean {
+	const name = id.toLowerCase();
+	if (name.includes("non-reasoning")) return false;
+	if (name.includes("imagine") || name.includes("image") || name.includes("video")) return false;
+	if (/^gpt-5(?:\.\d+)?-chat(?:[-.]|$)/.test(name)) return false;
+	return (
+		/^grok-3-(?:mini|reasoning)(?:[-.]|$)/.test(name) ||
+		name.startsWith("grok-4") ||
+		name.startsWith("grok-composer") ||
+		name.startsWith("grok-build") ||
+		name.startsWith("gpt-5") ||
+		/^o[1-4](?:[-.]|$)/.test(name) ||
+		name.includes("codex")
+	);
+}
+
 function toModel(value: Record<string, unknown>): ModelConfig {
 	const fallbackCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	const api = String(value.api ?? "openai-completions");
@@ -89,7 +108,7 @@ function toModel(value: Record<string, unknown>): ModelConfig {
 		name: String(value.name ?? value.id ?? ""),
 		api,
 		baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : base,
-		reasoning: Boolean(value.reasoning),
+		reasoning: value.reasoning === true || inferReasoning(String(value.id ?? "")),
 		thinkingLevelMap: value.thinkingLevelMap as ModelConfig["thinkingLevelMap"],
 		input: (Array.isArray(value.input) ? value.input : ["text"]).filter(
 			(item): item is "text" | "image" => item === "text" || item === "image",

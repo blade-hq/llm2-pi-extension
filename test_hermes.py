@@ -87,7 +87,7 @@ class HermesPluginTests(unittest.TestCase):
 
     def test_search_failure(self):
         os.environ["LLM2_API_KEY"] = "fake-key"
-        with patch.object(self.plugin, "urlopen", return_value=FakeResponse({})): 
+        with patch.object(self.plugin, "urlopen", return_value=FakeResponse({})):
             self.assertFalse(self.plugin.LLM2WebSearchProvider().search("q")["success"])
         with patch.object(self.plugin, "urlopen", side_effect=HTTPError("https://llm2.yangl.com.cn/v1/web-search", 401, "unauthorized", {}, None)):
             self.assertFalse(self.plugin.LLM2WebSearchProvider().search("q")["success"])
