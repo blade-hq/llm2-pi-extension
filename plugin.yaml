@@ -1,0 +1,10 @@
+name: llm2
+version: 0.1.6
+description: BladeAI LLM2 model provider, web search, and image generation for Hermes Agent
+homepage: https://github.com/blade-hq/llm2-pi-extension
+kind: backend
+requires_env:
+  - name: LLM2_API_KEY
+    description: 请粘贴 BladeAI Portal Key（以 sk-llm2- 开头，输入内容会隐藏）
+    url: https://llm2.yangl.com.cn
+    secret: true
