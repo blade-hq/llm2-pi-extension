@@ -87,6 +87,7 @@ function inferReasoning(id: string): boolean {
 	const name = id.toLowerCase();
 	if (name.includes("non-reasoning")) return false;
 	if (name.includes("imagine") || name.includes("image") || name.includes("video")) return false;
+	if (/^gpt-5(?:\.\d+)?-chat(?:[-.]|$)/.test(name)) return false;
 	return (
 		/^grok-3-(?:mini|reasoning)(?:[-.]|$)/.test(name) ||
 		name.startsWith("grok-4") ||

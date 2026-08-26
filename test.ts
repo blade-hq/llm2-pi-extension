@@ -59,12 +59,16 @@ function piHarness() {
 
 async function refresh(models: Array<Record<string, unknown>>) {
 	catalogModels = models;
-	const harness = piHarness();
-	await extension(harness.pi as never);
-	const registration = harness.registered as {
-		config: { refreshModels(context: { credential?: { type: "api_key"; key: string } }): Promise<Array<{ id: string; reasoning: boolean }>> };
-	};
-	return registration.config.refreshModels({ credential: { type: "api_key", key: "stored-pi-key" } });
+	try {
+		const harness = piHarness();
+		await extension(harness.pi as never);
+		const registration = harness.registered as {
+			config: { refreshModels(context: { credential?: { type: "api_key"; key: string } }): Promise<Array<{ id: string; reasoning: boolean }>> };
+		};
+		return await registration.config.refreshModels({ credential: { type: "api_key", key: "stored-pi-key" } });
+	} finally {
+		catalogModels = defaultCatalogModels;
+	}
 }
 
 describe("llm2 provider authentication", () => {
@@ -169,6 +173,26 @@ describe("catalog reasoning fallback", () => {
 	test("trusts an explicit catalog reasoning:true", async () => {
 		const models = await refresh([{ id: "custom-thinker", reasoning: true }]);
 		expect(models[0]?.reasoning).toBe(true);
+	});
+
+	test("does not enable GPT-5 chat variants", async () => {
+		const models = await refresh([
+			{ id: "gpt-5-chat-latest", reasoning: false },
+			{ id: "gpt-5.1-chat-latest", reasoning: false },
+			{ id: "gpt-5.4", reasoning: false },
+			{ id: "gpt-5-codex", reasoning: false },
+		]);
+		expect(Object.fromEntries(models.map(model => [model.id, model.reasoning]))).toEqual({
+			"gpt-5-chat-latest": false,
+			"gpt-5.1-chat-latest": false,
+			"gpt-5.4": true,
+			"gpt-5-codex": true,
+		});
+	});
+
+	test("restores the default catalog fixture after refresh", async () => {
+		await refresh([{ id: "custom-thinker", reasoning: true }]);
+		expect(catalogModels).toBe(defaultCatalogModels);
 	});
 });
 
