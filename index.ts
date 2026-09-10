@@ -12,12 +12,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const DEFAULT_BASE_URL = "https://llm2.yangl.com.cn/v1";
+const DEFAULT_BASE_URL = "https://llm3.bladeai.com.cn/v1";
 const DEFAULT_PROVIDER_ID = "llm2";
-const DEFAULT_PROVIDER_NAME = "BladeAI LLM2";
+const DEFAULT_PROVIDER_NAME = "BladeAI";
 const CATALOG_TIMEOUT_MS = 30_000;
 const OMP_STARTUP_CATALOG_TIMEOUT_MS = 3_000;
 
@@ -156,88 +155,6 @@ async function fetchCatalog(signal: AbortSignal | undefined, key: string): Promi
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", onAbort);
 	}
-}
-
-// Only consults the host's credential store, so callers can tell a key the
-// host has already persisted from one this extension is carrying in memory.
-async function keyFromRegistry(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
-	const providerID = env("LLM2_PROVIDER_ID", DEFAULT_PROVIDER_ID);
-	const registry = ctx.modelRegistry as {
-		getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
-		getProviderAuth?: (provider: string) => Promise<{ auth?: { apiKey?: string } } | undefined>;
-		getAuth?: (provider: string) => Promise<{ auth?: { apiKey?: string } } | undefined>;
-	} | undefined;
-	if (registry?.getApiKeyForProvider) {
-		const key = await registry.getApiKeyForProvider(providerID);
-		if (key && key !== "NO_AUTH" && key !== "kNoAuth") return key;
-	}
-	if (registry?.getProviderAuth) {
-		const auth = await registry.getProviderAuth(providerID);
-		const key = auth?.auth?.apiKey?.trim();
-		if (key) return key;
-	}
-	if (registry?.getAuth) {
-		const auth = await registry.getAuth(providerID);
-		const key = auth?.auth?.apiKey?.trim();
-		if (key) return key;
-	}
-	return undefined;
-}
-
-async function keyFromContext(ctx: { modelRegistry?: unknown }): Promise<string | undefined> {
-	const key = await keyFromRegistry(ctx);
-	if (key) return key;
-	// With a context the registry is the live credential source, so never fall
-	// back to something it handed over earlier -- that would outlive /logout.
-	return process.env.LLM2_API_KEY?.trim() || undefined;
-}
-
-async function portalRequest(
-	ctx: { modelRegistry?: unknown },
-	path: string,
-	init: RequestInit,
-): Promise<Response> {
-	const key = await keyFromContext(ctx);
-	if (!key) throw new Error("没有找到 Portal API Key，请运行 /login llm2，或设置 LLM2_API_KEY");
-	const headers = new Headers(init.headers);
-	headers.set("Accept", "application/json");
-	headers.set("Authorization", `Bearer ${key}`);
-	return fetch(`${baseURL()}${path}`, { ...init, headers });
-}
-
-function textResult(text: string, details: Record<string, unknown> = {}) {
-	return { content: [{ type: "text" as const, text }], details };
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-async function generateImage(
-	ctx: { modelRegistry?: unknown },
-	params: { prompt: string; model?: string; size?: string; quality?: string },
-	signal?: AbortSignal,
-) {
-	const response = await portalRequest(ctx, "/images/generations", {
-		method: "POST",
-		signal,
-		headers: { "Content-Type": "application/json", "X-App-Name": "pi-llm2-image" },
-		body: JSON.stringify({
-			prompt: params.prompt,
-			model: params.model || "gpt-image-2",
-			size: params.size || "1024x1024",
-			...(params.quality ? { quality: params.quality } : {}),
-		}),
-	});
-	const payload = await readJSON(response);
-	if (!response.ok) {
-		const error = payload.error as { message?: string } | undefined;
-		throw new Error(error?.message || `图片生成失败（HTTP ${response.status}）`);
-	}
-	const data = payload.data as Array<{ url?: string }> | undefined;
-	const url = data?.[0]?.url;
-	if (!url) throw new Error("图片接口没有返回图片链接");
-	return url;
 }
 
 const PURGE_BACKUP_SUFFIX = ".llm2-purged.bak";
@@ -570,59 +487,6 @@ async function purgeLegacyProvider(
 	return (await purgeConfigFile(file, providerID, isOMP, settleKey)) ? [file] : [];
 }
 
-function registerTools(pi: ExtensionAPI) {
-	pi.registerTool({
-		name: "blade_web_search",
-		label: "BladeAI 网络搜索",
-		description: "使用 BladeAI 的专属网络搜索能力查询最新信息，并返回带链接的最终回答。适合新闻、产品更新、文档变化和需要实时信息的问题。",
-		promptSnippet: "BladeAI 网络搜索：查询实时信息并返回最终回答。",
-		parameters: Type.Object({
-			query: Type.String({ description: "要搜索的问题，尽量写清楚时间范围和目标。" }),
-			instructions: Type.Optional(Type.String({ description: "可选：对回答风格或范围的补充要求。" })),
-		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			try {
-				const response = await portalRequest(ctx, "/web-search", {
-					method: "POST",
-					signal,
-					headers: { "Content-Type": "application/json", "X-App-Name": "pi-llm2-search" },
-					body: JSON.stringify({ query: params.query, instructions: params.instructions }),
-				});
-				const payload = await readJSON(response);
-				if (!response.ok) {
-					const error = payload.error as { message?: string } | undefined;
-					throw new Error(error?.message || `网络搜索失败（HTTP ${response.status}）`);
-				}
-				if (typeof payload.answer !== "string" || !payload.answer.trim()) throw new Error("搜索接口没有返回回答");
-				return textResult(payload.answer, { model: payload.model, id: payload.id });
-			} catch (error) {
-				return textResult(`网络搜索失败：${errorMessage(error)}`, { error: true });
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "blade_generate_image",
-		label: "BladeAI 图片生成",
-		description: "根据文字描述生成图片。返回图片链接；如果客户端支持图片工具结果，也会把生成的图片带回当前对话。",
-		promptSnippet: "BladeAI 图片生成：根据描述生成图片并返回链接。",
-		parameters: Type.Object({
-			prompt: Type.String({ description: "图片内容、构图、风格、文字和尺寸的详细描述。" }),
-			model: Type.Optional(Type.String({ description: "图片模型，默认 gpt-image-2。" })),
-			size: Type.Optional(Type.String({ description: "图片尺寸，例如 1024x1024、1536x1024 或 1024x1536。" })),
-			quality: Type.Optional(Type.String({ description: "图片质量：low、medium 或 high。" })),
-		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			try {
-				const url = await generateImage(ctx, params, signal);
-				return textResult(`图片已生成：${url}`, { url });
-			} catch (error) {
-				return textResult(`图片生成失败：${errorMessage(error)}`, { error: true });
-			}
-		},
-	});
-}
-
 type AuthStorageLike = {
 	peekApiKey?(providerID: string): Promise<string | undefined> | string | undefined;
 	set?(providerID: string, credential: { type: string; key: string }): Promise<void> | void;
@@ -896,7 +760,6 @@ export default async function bladeAIExtension(pi: ExtensionAPI) {
 	// locally installed pi-ai can disagree with the host Pi about the refresh
 	// context (store vs publish) and abort the /model catalog update.
 	pi.registerProvider(providerID, initialModels?.length ? { ...providerConfig, models: initialModels } : providerConfig);
-	registerTools(pi);
 
 	const host = pi as unknown as {
 		on?(event: string, handler: (event: unknown, ctx: SessionContext) => Promise<void>): void;
