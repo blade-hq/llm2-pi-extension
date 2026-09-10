@@ -9,8 +9,8 @@ Research Hermes Agent。Portal 后端保持私有；这里的代码只在用户�
 Pi / Oh My Pi：
 
 ```bash
-pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
-omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.6
+pi install git:github.com/blade-hq/llm2-pi-extension@v0.1.7
+omp plugin install git:github.com/blade-hq/llm2-pi-extension@v0.1.7
 ```
 
 Hermes Agent：
@@ -22,6 +22,8 @@ hermes plugins install blade-hq/llm2-pi-extension --enable
 Hermes 安装时会显示隐藏输入框，提示“请粘贴 BladeAI Portal Key（以
 `sk-llm2-` 开头）”。直接粘贴 Key 并回车即可，Hermes 会自动保存；普通用户
 不需要理解或手动设置环境变量。若跳过了提示，可运行 `hermes config` 再填写。
+
+升级后请重启 Pi / Oh My Pi，以卸载旧进程注册的工具。新门户从空库上线，需要在 `https://llm3.bladeai.com.cn` 重新领取 Key，然后更新 `LLM2_API_KEY` 或执行 `/login llm2`。若此前设置了 `LLM2_BASE_URL`，请删除该覆盖或改为新域名。
 
 ## 配置与使用
 
@@ -49,19 +51,19 @@ image_gen:
 ```
 
 高级用户可以用 `LLM2_API_KEY` 覆盖已保存的 Key，用 `LLM2_BASE_URL` 覆盖默认
-地址 `https://llm2.yangl.com.cn/v1`。
+地址。Pi / Oh My Pi v0.1.7 默认使用 `https://llm3.bladeai.com.cn/v1`；Hermes 的独立插件仍沿用旧地址和工具，本次未适配新门户。
 
 ## 能力说明
 
 - `llm2` 模型提供商：通过 Portal 的 OpenAI 兼容 Chat Completions 接口工作。
 - Hermes 网络搜索：调用 `/v1/web-search`，返回 BladeAI 整理后的最终 `answer`，封装为一条结果；不是原始 SERP 列表，也不支持网页抽取。
 - Hermes 图片生成：调用 `/v1/images/generations`，支持 `gpt-image-2`、`gpt-image-1.5`。生成图片会自动下载到 Hermes 的图片缓存，避免下游再次下载临时 URL；当前只支持文生图。
-- Pi / Oh My Pi 仍提供原有的 `blade_web_search` 和 `blade_generate_image` 工具。
+- Pi / Oh My Pi v0.1.7 只注册模型 provider，不再注册搜索和图片工具。支持目录中的 Chat Completions 和 Responses 模型。
 
 模型目录来自：
 
 ```text
-GET https://llm2.yangl.com.cn/pi/catalog
+GET https://llm3.bladeai.com.cn/pi/catalog
 Authorization: Bearer <Portal Key>
 ```
 

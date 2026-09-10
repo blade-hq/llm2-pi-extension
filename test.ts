@@ -72,6 +72,21 @@ async function refresh(models: Array<Record<string, unknown>>) {
 }
 
 describe("llm2 provider authentication", () => {
+	test("Pi and OMP preserve Responses model protocol and endpoint", async () => {
+		catalogModels = [{ ...defaultCatalogModels[0], api: "openai-responses", baseUrl: "https://llm3.bladeai.com.cn/v1" }];
+		try {
+			const pi = piHarness();
+			await extension(pi.pi as never);
+			const p = pi.registered as { config: { refreshModels(ctx: unknown): Promise<any[]> } };
+			const omp = ompHarness({});
+			await extension(omp.pi as never);
+			const o = omp.registered as { config: { fetchDynamicModels(key: string): Promise<any[]> } };
+			for (const models of [await p.config.refreshModels({ credential: { type: "api_key", key: "test-key" } }), await o.config.fetchDynamicModels("test-key")]) {
+				expect(models[0].api).toBe("openai-responses");
+				expect(models[0].baseUrl).toBe("https://llm3.bladeai.com.cn/v1");
+			}
+		} finally { catalogModels = defaultCatalogModels; }
+	});
 	test("Pi config-form refresh uses a stored API-key credential", async () => {
 		const harness = piHarness();
 		await extension(harness.pi as never);
@@ -86,6 +101,7 @@ describe("llm2 provider authentication", () => {
 		});
 		expect(models.map(model => model.id)).toEqual(["test-model"]);
 		expect(requests.at(-1)?.authorization).toBe("Bearer stored-pi-key");
+		expect(requests.at(-1)?.url).toBe("https://llm3.bladeai.com.cn/pi/catalog");
 	});
 
 	test("Pi catalog refresh works when the host omits signal", async () => {
@@ -806,18 +822,11 @@ describe("api key handling", () => {
 		expect(readAuth().llm2?.key).toBe("sk-already-stored");
 	});
 
-	test("stops authenticating once the registry no longer has a credential", async () => {
-		// Simulates /logout while the client stays open: the key cached at load
-		// time must not keep tool calls authenticated.
-		const harness = ompHarness({ discoverAuthStorage: async () => ({ peekApiKey: () => "sk-stored" }) });
-		await extension(harness.pi as never);
-		const search = harness.tools.find(tool => tool.name === "blade_web_search") as {
-			execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ text: string }> }>;
-		};
-		const result = await search.execute("call-1", { query: "x" }, undefined, undefined, {
-			modelRegistry: { getApiKeyForProvider: async () => undefined },
-		});
-		expect(result.content[0]?.text).toContain("没有找到 Portal API Key");
+	test("Pi and OMP register no tools", async () => {
+		for (const harness of [piHarness(), ompHarness({})]) {
+			await extension(harness.pi as never);
+			expect(harness.tools).toEqual([]);
+		}
 	});
 
 	test("model refresh stops using a credential removed after load", async () => {
